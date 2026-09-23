@@ -20,6 +20,7 @@
       "expo-secure-store",
       "@config-plugins/react-native-webrtc",
       ["./plugins/with-voip-call", { "apnsEnvironment": "development" }],
+      "./plugins/with-ios-scene-lifecycle",
       "@config-plugins/react-native-blob-util",
       "@config-plugins/react-native-pdf"
     ]
