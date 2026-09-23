@@ -28,6 +28,7 @@ import { ConversationQueue, type QueuedMessage } from "./conversation-queue";
 import { runConversationTurn } from "./conversation-run";
 import { MailToolCard } from "./mail-tool-card";
 import { FileThreadCard, TaskThreadCard } from "./thread-artifacts";
+import { restoreSavedMessages } from "./thread-hydration";
 import { type Selection, useMuseThread } from "./threads";
 import { Button, Card, CheckRow, colors, ErrorNotice, s } from "./ui";
 import { useWorkspace } from "./workspace";
@@ -213,14 +214,23 @@ export function ChatScreen({
       try {
         if (richThreads) {
           if (selection.existing) {
-            const { messages } = await api.request<{ messages: Message[] }>(
-              `/api/copilotkit/threads/${encodeURIComponent(threadId)}/messages`,
-            );
-            if (active) agent.setMessages(messages);
-            await runConversationTurn(
-              agentId,
-              () => copilotkit.connectAgent({ agent }),
-              (onError) => copilotkit.subscribe({ onError }),
+            // A first CopilotKit connection clears the agent's local messages.
+            // Restore Oracle's authoritative history after that reset.
+            await restoreSavedMessages(
+              () =>
+                runConversationTurn(
+                  agentId,
+                  () => copilotkit.connectAgent({ agent }),
+                  (onError) => copilotkit.subscribe({ onError }),
+                ),
+              async () =>
+                (
+                  await api.request<{ messages: Message[] }>(
+                    `/api/copilotkit/threads/${encodeURIComponent(threadId)}/messages`,
+                  )
+                ).messages,
+              (messages) => agent.setMessages(messages),
+              () => active,
             );
           }
         } else {
