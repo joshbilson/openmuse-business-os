@@ -10,7 +10,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "au.com.wineandlarder.openmuse",
-      "appleTeamId": "6L9MH922NF"
+      "appleTeamId": "K5AYLYH9GW"
     },
     "android": { "package": "au.com.wineandlarder.openmuse" },
     "web": { "bundler": "metro", "name": "OpenMuse — a little room for everything" },
