@@ -24,20 +24,37 @@ export class Auth {
     await this.db.put("system", "sessions", {
       id: digest(token).toString("hex"),
       owner: "local-user",
-      expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+      expiresAt: Date.now() + this.sessionLifetime(),
     });
     return { token, mode: this.config.mode };
   }
+  private sessionLifetime() {
+    const days = Number(process.env.SESSION_TTL_DAYS ?? (this.config.mode === "live" ? "30" : "1"));
+    if (!Number.isFinite(days) || days < 1 || days > 90)
+      throw new AppError("SESSION_TTL_DAYS must be between 1 and 90", 503);
+    return days * 24 * 60 * 60 * 1000;
+  }
+  sessionCookieMaxAge() {
+    return Math.floor(this.sessionLifetime() / 1000);
+  }
   async owner(authorization?: string) {
     if (!authorization?.startsWith("Bearer ")) throw new AppError("Sign in to OpenMuse", 401);
+    return this.ownerToken(authorization.slice(7));
+  }
+  async ownerToken(token: string) {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(token))
+      throw new AppError("Session expired. Sign in again.", 401);
     const session = await this.db.get<{ owner: string; expiresAt: number }>(
       "system",
       "sessions",
-      digest(authorization.slice(7)).toString("hex"),
+      digest(token).toString("hex"),
     );
-    if (!session || session.expiresAt < Date.now())
+    if (!session || session.expiresAt <= Date.now())
       throw new AppError("Session expired. Sign in again.", 401);
     return session.owner;
+  }
+  async revokeToken(token: string) {
+    await this.db.remove("system", "sessions", digest(token).toString("hex"));
   }
   sign(owner: string, path: string) {
     const expires = String(Date.now() + 15 * 60 * 1000);

@@ -15,10 +15,15 @@ export interface Config {
   accessKey?: string;
   encryptionKey?: string;
   model?: string;
-  agentBackend: "sample" | "model" | "agui";
+  agentBackend: "sample" | "hermes" | "model" | "agui";
   agentUrl?: string;
   agentToken?: string;
+  hermesModel?: string;
+  hermesProvider?: string;
+  hermesProfile?: string;
+  /** Legacy demo/test-only field; never required by the self-hosted API. */
   intelligenceApiKey?: string;
+  actionApprovalMode?: "manual" | "standing-authority";
   googleClientId?: string;
   googleClientSecret?: string;
   googleRedirectUri: string;
@@ -31,34 +36,26 @@ export interface Config {
   allowedOrigins: string[];
 }
 
-export const intelligenceKeyRequiredMessage =
-  "OpenMuse requires CPK_INTELLIGENCE_API_KEY. " +
-  "Run `npx copilotkit@latest login` and `npx copilotkit@latest project select`, " +
-  "then set the generated server-only key. " +
-  "See https://docs.copilotkit.ai/intelligence/connect-your-runtime";
-
 export function required(name: string, message: string, value = process.env[name]): string {
   if (!value?.trim()) throw new Error(message);
   return value.trim();
 }
+/** Kept for the standalone upstream demo, not the business OS server. */
+export const intelligenceKeyRequiredMessage =
+  "CPK_INTELLIGENCE_API_KEY is required by the upstream demo only";
 
-export function assertApiDeploymentConfig(
-  config: Config,
-): asserts config is Config & { intelligenceApiKey: string } {
-  required(
-    "CPK_INTELLIGENCE_API_KEY",
-    intelligenceKeyRequiredMessage,
-    config.intelligenceApiKey ?? "",
-  );
+export function assertApiDeploymentConfig(config: Config): void {
+  if (config.mode === "live" && config.agentBackend !== "hermes")
+    throw new Error("Live mode requires the Hermes agent backend");
 }
 
 export function readConfig(): Config {
   const mode = process.env.WORKSPACE_MODE ?? "sample";
   if (mode !== "sample" && mode !== "live")
     throw new Error("WORKSPACE_MODE must be sample or live");
-  const backend = process.env.AGENT_BACKEND ?? (mode === "sample" ? "sample" : "model");
-  if (backend !== "sample" && backend !== "model" && backend !== "agui")
-    throw new Error("AGENT_BACKEND must be sample, model or agui");
+  const backend = process.env.AGENT_BACKEND ?? (mode === "sample" ? "sample" : "hermes");
+  if (backend !== "sample" && backend !== "hermes")
+    throw new Error("AGENT_BACKEND must be sample or hermes");
   if (mode === "live" && backend === "sample")
     throw new Error("Live workspaces cannot use the sample agent");
   const port = Number(process.env.PORT ?? 8787);
@@ -74,9 +71,13 @@ export function readConfig(): Config {
     encryptionKey: process.env.TOKEN_ENCRYPTION_KEY,
     model: process.env.MODEL,
     agentBackend: backend,
-    agentUrl: process.env.AGENT_URL,
-    agentToken: process.env.AGENT_TOKEN,
-    intelligenceApiKey: required("CPK_INTELLIGENCE_API_KEY", intelligenceKeyRequiredMessage),
+    agentUrl: process.env.HERMES_API_URL ?? process.env.AGENT_URL,
+    agentToken: process.env.HERMES_API_KEY ?? process.env.AGENT_TOKEN,
+    hermesModel: process.env.HERMES_MODEL,
+    hermesProvider: process.env.HERMES_PROVIDER,
+    hermesProfile: process.env.HERMES_PROFILE,
+    actionApprovalMode:
+      process.env.ACTION_APPROVAL_MODE === "standing-authority" ? "standing-authority" : "manual",
     googleClientId: process.env.GOOGLE_CLIENT_ID,
     googleClientSecret: process.env.GOOGLE_CLIENT_SECRET,
     googleRedirectUri: `${publicUrl}/api/google/callback`,

@@ -1,0 +1,20 @@
+{
+  "application": {
+    "repository": "https://github.com/CopilotKit/openmuse.git",
+    "commit": "bb7ce4e1c6e523bf282a655c63621e3ed9e75150",
+    "license": "MIT"
+  },
+  "harness": {
+    "repository": "https://github.com/NousResearch/hermes-agent.git",
+    "commit": "741fa6acc1545f0d1cd307ea96f0cba7023ad450",
+    "version": "0.21.3",
+    "python": "3.13",
+    "additionalDependencies": [
+      "aiohttp==3.14.3",
+      "mcp==2.0.0",
+      "httpx2==2.7.0",
+      "starlette==1.3.1"
+    ],
+    "license": "MIT"
+  }
+}

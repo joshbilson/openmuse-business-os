@@ -148,6 +148,7 @@ export interface ActionProposal {
     | "denied"
     | "cancelled"
     | "expired";
+  authority?: "manual" | "standing-authority";
   hash: string;
   createdAt: string;
   expiresAt: string;

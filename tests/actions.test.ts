@@ -66,6 +66,27 @@ test("concurrent approval consumes the proposal only once", async () => {
   assert.equal(saved?.status, "succeeded");
   assert.equal(saved?.result, "provider-receipt");
 });
+test("standing authority executes a prepared action once with a durable receipt", async () => {
+  let calls = 0;
+  const service = new ActionService(
+    db,
+    {
+      execute: async () => {
+        calls++;
+        return "mail-receipt-1";
+      },
+      connected: async () => true,
+    },
+    "standing-authority",
+  );
+  const first = await service.propose("standing-user", email, "standing-action-1");
+  const replay = await service.propose("standing-user", email, "standing-action-1");
+  assert.equal(first.status, "succeeded");
+  assert.equal(first.authority, "standing-authority");
+  assert.equal(first.result, "mail-receipt-1");
+  assert.equal(replay.id, first.id);
+  assert.equal(calls, 1);
+});
 test("wrong owner and stale hash cannot approve", async () => {
   const service = new ActionService(db, {
     execute: async () => "sent",

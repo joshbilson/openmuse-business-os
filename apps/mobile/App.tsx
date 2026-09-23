@@ -38,8 +38,10 @@ import { ComputerEntry } from "./src/computer";
 import { ComputerDraftProvider } from "./src/computer-drafts";
 import { Details } from "./src/details";
 import { BrowserScreen, CalendarScreen, FilesScreen, MailScreen } from "./src/screens";
+import { getSavedAccessKey, saveAccessKey } from "./src/session-secret";
 import { ThreadsProvider, ThreadsSheet, useMuseThread } from "./src/threads";
 import { Button, Card, colors, ErrorNotice, Field, IconButton, Mascot, s } from "./src/ui";
+import { VoiceCallWidget } from "./src/voice-call";
 import { type Detail, useWorkspace, WorkspaceContext } from "./src/workspace";
 
 const nav: { id: Section; label: string; icon: LucideIcon }[] = [
@@ -75,7 +77,8 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
-      const session = await createSession(key);
+      const session = await createSession(key || (await getSavedAccessKey()) || undefined);
+      if (key) await saveAccessKey(key);
       setToken(session.token);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -240,10 +243,11 @@ function WorkspaceShell({
   error: string;
   prompt?: { id: number; text: string };
 }) {
-  const { workspace, section, navigate, open } = useWorkspace();
+  const { workspace, section, navigate, open, api, notify } = useWorkspace();
   const { data } = useAgentWorkspace();
   const {
     selection,
+    select,
     visited,
     mainId,
     loading: threadsLoading,
@@ -338,6 +342,21 @@ function WorkspaceShell({
                 </Text>
               </Pressable>
               {section === "chat" && <ComputerEntry />}
+            </View>
+            <View style={{ position: "absolute", right: 46, top: 16 }}>
+              <VoiceCallWidget
+                api={api}
+                agentName={agentName}
+                threadId={selection.id}
+                notify={notify}
+                onNotificationOpen={(data) => {
+                  if (typeof data.threadId === "string")
+                    select({ id: data.threadId, existing: true });
+                  else if (typeof data.taskId === "string")
+                    open({ type: "task", taskId: data.taskId });
+                  else navigate("activity");
+                }}
+              />
             </View>
             <View style={{ position: "absolute", right: 0, top: 16 }}>
               <IconButton

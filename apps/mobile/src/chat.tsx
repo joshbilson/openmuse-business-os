@@ -212,12 +212,17 @@ export function ChatScreen({
     async function hydrate() {
       try {
         if (richThreads) {
-          if (selection.existing)
+          if (selection.existing) {
+            const { messages } = await api.request<{ messages: Message[] }>(
+              `/api/copilotkit/threads/${encodeURIComponent(threadId)}/messages`,
+            );
+            if (active) agent.setMessages(messages);
             await runConversationTurn(
               agentId,
               () => copilotkit.connectAgent({ agent }),
               (onError) => copilotkit.subscribe({ onError }),
             );
+          }
         } else {
           const { messages } = await api.request<{ messages: Message[] }>("/api/conversation");
           if (active) agent.setMessages(messages);
@@ -238,7 +243,17 @@ export function ChatScreen({
       replay.unsubscribe();
       if (richThreads) void agent.detachActiveRun().catch(() => {});
     };
-  }, [agent, agentId, api, copilotkit, isReady, historyAttempt, richThreads, selection.existing]);
+  }, [
+    agent,
+    agentId,
+    api,
+    copilotkit,
+    isReady,
+    historyAttempt,
+    richThreads,
+    selection.existing,
+    threadId,
+  ]);
   const saveHistory = useCallback(async () => {
     if (!richThreads) await api.request("/api/conversation", { messages: agent.messages }, "PUT");
     setSaveError("");
