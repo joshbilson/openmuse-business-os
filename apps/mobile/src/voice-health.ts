@@ -23,8 +23,9 @@ export class VoiceCallHealth {
     private readonly schedule: (
       callback: () => void,
       delay: number,
-    ) => ReturnType<typeof setTimeout> = setTimeout,
-    private readonly cancel: (timer: ReturnType<typeof setTimeout>) => void = clearTimeout,
+    ) => ReturnType<typeof setTimeout> = (callback, delay) => setTimeout(callback, delay),
+    private readonly cancel: (timer: ReturnType<typeof setTimeout>) => void = (timer) =>
+      clearTimeout(timer),
   ) {}
 
   start() {

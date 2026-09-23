@@ -81,3 +81,50 @@ test("prolonged loss and provider session close terminate once", () => {
   provider.start();
   assert.deepEqual(closed, ["The voice session ended."]);
 });
+
+test("default browser timers are not invoked with the monitor as their receiver", () => {
+  const originalSet = Object.getOwnPropertyDescriptor(globalThis, "setTimeout");
+  const originalClear = Object.getOwnPropertyDescriptor(globalThis, "clearTimeout");
+  assert.ok(originalSet);
+  assert.ok(originalClear);
+  let scheduledBy: unknown;
+  let cancelledBy: unknown;
+  let scheduled = false;
+  let cancelled = false;
+  const events: string[] = [];
+  let health: VoiceCallHealth;
+  Object.defineProperty(globalThis, "setTimeout", {
+    configurable: true,
+    value: function (this: unknown) {
+      scheduled = true;
+      scheduledBy = this;
+      return 1;
+    },
+  });
+  Object.defineProperty(globalThis, "clearTimeout", {
+    configurable: true,
+    value: function (this: unknown) {
+      cancelled = true;
+      cancelledBy = this;
+    },
+  });
+  try {
+    health = new VoiceCallHealth({
+      onReconnecting: () => events.push("reconnecting"),
+      onRecovered: () => events.push("recovered"),
+      onEnded: () => events.push("ended"),
+    });
+    health.media({ state: "connected" });
+    health.start();
+    health.media({ state: "disconnected" });
+    health.media({ state: "connected" });
+    assert.equal(scheduled, true);
+    assert.equal(cancelled, true);
+    assert.notEqual(scheduledBy, health);
+    assert.notEqual(cancelledBy, health);
+    assert.deepEqual(events, ["reconnecting", "recovered"]);
+  } finally {
+    Object.defineProperty(globalThis, "setTimeout", originalSet);
+    Object.defineProperty(globalThis, "clearTimeout", originalClear);
+  }
+});
