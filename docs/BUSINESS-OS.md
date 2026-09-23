@@ -44,7 +44,9 @@ Use the pinned source and dependencies in `upstream.lock.json`. The Hermes base 
 
 Automated checks cover ownership, conversation replay, task restart, repeat-action suppression, source evidence, OAuth state/refresh races, notification retry and call invitation lifecycle. Native and JavaScript builds validate compilation, not physical-device behavior.
 
-The packaged iOS Simulator app has built and launched using the original OpenMuse welcome interface. A physical iPhone was detected, but signing was blocked by Xcode's missing account and missing development provisioning profile for the new bundle. Real APNs delivery, foreground/background/locked/cold-start/force-quit calls, human overlapping speech, interruption, reconnection and Bluetooth/speaker routing remain mandatory physical acceptance checks. Consult the private deployment acceptance report for the current executed checks rather than interpreting these implementation notes as a claim that every device test passed.
+The iOS app has been signed with the verified distribution identity and a dedicated Ad Hoc device profile, installed on the physical iPhone, and opened with the original OpenMuse welcome interface. An Expo config plugin supplies the scene lifecycle required for this iPhone's iOS 27 SDK build. Workspace sign-in and both production alert/VoIP registrations reached Oracle. One foreground incoming call rang and its answer reached Oracle, but no voice session or working audio followed. The next build retains the saved sign-in and adds a bounded local call-stage diagnostic ring.
+
+Ordinary alert visibility, working physical audio, background/locked/cold-start/force-quit calls, human overlapping speech, interruption, reconnection and Bluetooth/speaker routing remain mandatory acceptance checks. APNs acceptance, native answer events and successful compilation are separate from those observations. Consult the [iPhone acceptance guide](../apps/mobile/docs/IOS-CALLING.md) and private deployment receipts for executed checks.
 
 ## Upstream maintenance
 

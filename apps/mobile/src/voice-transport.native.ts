@@ -1,5 +1,6 @@
 import { mediaDevices, RTCPeerConnection, RTCSessionDescription } from "react-native-webrtc";
 import type { VoiceTransportHealth } from "./voice-health";
+import { type VoipDiagnosticStage, voip } from "./voip";
 
 export type VoiceTransport = {
   offer: string;
@@ -45,8 +46,13 @@ function waitUntilChannelOpen(channel: ReturnType<RTCPeerConnection["createDataC
   });
 }
 
-export async function createVoiceTransport(): Promise<VoiceTransport> {
+export async function createVoiceTransport(callId?: string): Promise<VoiceTransport> {
+  const record = (stage: VoipDiagnosticStage) => {
+    if (callId) void voip.recordStage(callId, stage).catch(() => {});
+  };
+  record("js_mic_request");
   const stream = await mediaDevices.getUserMedia({ audio: true, video: false });
+  record("js_mic_ready");
   const peer = new RTCPeerConnection({ iceServers: [] });
   let closed = false;
   let listener: ((health: VoiceTransportHealth) => void) | undefined;
@@ -81,8 +87,10 @@ export async function createVoiceTransport(): Promise<VoiceTransport> {
         // Other provider events are not needed for transport health.
       }
     };
+    record("js_offer_started");
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
+    record("js_offer_ready");
     await new Promise<void>((resolve, reject) => {
       if (peer.iceGatheringState === "complete") {
         resolve();
@@ -96,6 +104,7 @@ export async function createVoiceTransport(): Promise<VoiceTransport> {
         }
       };
     });
+    record("js_ice_ready");
     const sdp = peer.localDescription?.sdp;
     if (!sdp) throw new Error("Could not prepare the voice connection.");
     return {

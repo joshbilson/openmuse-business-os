@@ -4,8 +4,30 @@ import ExpoModulesCore
 import PushKit
 import WebRTC
 
+private struct VoiceDiagnostic: Codable {
+  let timestamp: String
+  let callId: String
+  let stage: String
+  let microphonePermission: String
+  let audioActivated: Bool
+}
+
 private final class VoipCallCenter: NSObject, PKPushRegistryDelegate, CXProviderDelegate {
   static let shared = VoipCallCenter()
+
+  private static let diagnosticStages: Set<String> = [
+    "native_push_received", "native_push_reported", "native_push_report_failed",
+    "native_answer_action", "native_outgoing_action", "native_end_action",
+    "native_end_requested", "native_end_completed", "native_end_failed",
+    "native_audio_activated", "native_audio_deactivated", "native_provider_reset",
+    "native_watchdog_started", "native_watchdog_expired", "native_call_connected",
+    "js_answer_received", "js_answer_request", "js_answer_response",
+    "js_audio_wait_start", "js_audio_wait_ready", "js_connect_error",
+    "js_connect_finished", "js_mic_request", "js_mic_ready",
+    "js_offer_started", "js_offer_ready", "js_ice_ready",
+    "js_session_request", "js_session_response", "js_media_ready",
+    "js_finish_started", "js_finish_complete",
+  ]
 
   private let provider: CXProvider
   private let controller = CXCallController()
@@ -17,6 +39,7 @@ private final class VoipCallCenter: NSObject, PKPushRegistryDelegate, CXProvider
   private var pending: [[String: Any]] = []
   private var token: String?
   private var audioActivated = false
+  private var diagnostics: [VoiceDiagnostic] = []
   var observing = false
   var listener: (([String: Any]) -> Void)?
 
@@ -29,6 +52,53 @@ private final class VoipCallCenter: NSObject, PKPushRegistryDelegate, CXProvider
     provider = CXProvider(configuration: configuration)
     super.init()
     provider.setDelegate(self, queue: .main)
+    if let url = diagnosticsURL(),
+       let data = try? Data(contentsOf: url), data.count <= 64_000,
+       let saved = try? JSONDecoder().decode([VoiceDiagnostic].self, from: data) {
+      diagnostics = Array(saved.suffix(64))
+    }
+  }
+
+  private func diagnosticsURL() -> URL? {
+    guard let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+    let directory = support.appendingPathComponent("OpenMuse", isDirectory: true)
+    try? FileManager.default.createDirectory(
+      at: directory,
+      withIntermediateDirectories: true,
+      attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
+    )
+    return directory.appendingPathComponent("voice-diagnostics.json")
+  }
+
+  func recordStage(_ stage: String, callId: String) {
+    if !Thread.isMainThread {
+      DispatchQueue.main.async { self.recordStage(stage, callId: callId) }
+      return
+    }
+    guard Self.diagnosticStages.contains(stage), let uuid = UUID(uuidString: callId) else { return }
+    let permission: String
+    switch AVAudioSession.sharedInstance().recordPermission {
+    case .granted: permission = "granted"
+    case .denied: permission = "denied"
+    case .undetermined: permission = "undetermined"
+    @unknown default: permission = "unknown"
+    }
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    diagnostics.append(VoiceDiagnostic(
+      timestamp: formatter.string(from: Date()),
+      callId: uuid.uuidString.lowercased(),
+      stage: stage,
+      microphonePermission: permission,
+      audioActivated: audioActivated
+    ))
+    if diagnostics.count > 64 { diagnostics.removeFirst(diagnostics.count - 64) }
+    guard let url = diagnosticsURL(), let data = try? JSONEncoder().encode(diagnostics) else { return }
+    try? data.write(to: url, options: .atomic)
+    try? FileManager.default.setAttributes(
+      [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+      ofItemAtPath: url.path
+    )
   }
 
   func start() {
@@ -59,9 +129,11 @@ private final class VoipCallCenter: NSObject, PKPushRegistryDelegate, CXProvider
   }
 
   private func expectConnection(_ uuid: UUID) {
+    recordStage("native_watchdog_started", callId: callIds[uuid] ?? uuid.uuidString)
     watchdogs[uuid]?.cancel()
     let work = DispatchWorkItem { [weak self] in
       guard let self, self.callIds[uuid] != nil else { return }
+      self.recordStage("native_watchdog_expired", callId: self.callIds[uuid] ?? uuid.uuidString)
       self.provider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
       self.emit(["type": "end"].merging(self.details(uuid)) { _, new in new })
       self.callIds.removeValue(forKey: uuid)
@@ -92,10 +164,16 @@ private final class VoipCallCenter: NSObject, PKPushRegistryDelegate, CXProvider
 
   func end(callId: String) async throws {
     guard let uuid = uuid(for: callId) else { return }
+    recordStage("native_end_requested", callId: callId)
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
       controller.request(CXTransaction(action: CXEndCallAction(call: uuid))) { error in
-        if let error { continuation.resume(throwing: error) }
-        else { continuation.resume() }
+        if let error {
+          self.recordStage("native_end_failed", callId: callId)
+          continuation.resume(throwing: error)
+        } else {
+          self.recordStage("native_end_completed", callId: callId)
+          continuation.resume()
+        }
       }
     }
   }
@@ -122,6 +200,7 @@ private final class VoipCallCenter: NSObject, PKPushRegistryDelegate, CXProvider
 
   func connected(callId: String) {
     guard let uuid = uuid(for: callId) else { return }
+    recordStage("native_call_connected", callId: callId)
     watchdogs.removeValue(forKey: uuid)?.cancel()
     if !incoming.contains(uuid) { provider.reportOutgoingCall(with: uuid, connectedAt: Date()) }
   }
@@ -160,6 +239,7 @@ private final class VoipCallCenter: NSObject, PKPushRegistryDelegate, CXProvider
     guard type == .voIP else { completion(); return }
     let data = payload.dictionaryPayload
     let callId = data["callId"] as? String ?? UUID().uuidString
+    recordStage("native_push_received", callId: callId)
     let uuid = UUID(uuidString: callId) ?? UUID()
     let name = data["callerName"] as? String ?? "OpenMuse"
     callIds[uuid] = callId
@@ -172,9 +252,11 @@ private final class VoipCallCenter: NSObject, PKPushRegistryDelegate, CXProvider
     provider.reportNewIncomingCall(with: uuid, update: update) { [weak self] error in
       defer { completion() }
       guard error == nil else {
+        self?.recordStage("native_push_report_failed", callId: callId)
         self?.emit(["type": "callError", "callId": callId, "message": error!.localizedDescription])
         return
       }
+      self?.recordStage("native_push_reported", callId: callId)
       var event: [String: Any] = ["type": "incoming", "callId": callId]
       if let threadId = data["threadId"] as? String { event["threadId"] = threadId }
       if let expiresAt = data["expiresAt"] { event["expiresAt"] = expiresAt }
@@ -183,6 +265,7 @@ private final class VoipCallCenter: NSObject, PKPushRegistryDelegate, CXProvider
   }
 
   func providerDidReset(_ provider: CXProvider) {
+    for callId in callIds.values { recordStage("native_provider_reset", callId: callId) }
     for work in watchdogs.values { work.cancel() }
     watchdogs.removeAll()
     for uuid in callIds.keys { emit(["type": "end"].merging(details(uuid)) { _, new in new }) }
@@ -192,6 +275,7 @@ private final class VoipCallCenter: NSObject, PKPushRegistryDelegate, CXProvider
   }
 
   func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
+    recordStage("native_outgoing_action", callId: callIds[action.callUUID] ?? action.callUUID.uuidString)
     do {
       try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .defaultToSpeaker])
       provider.reportOutgoingCall(with: action.callUUID, startedConnectingAt: Date())
@@ -202,6 +286,7 @@ private final class VoipCallCenter: NSObject, PKPushRegistryDelegate, CXProvider
   }
 
   func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
+    recordStage("native_answer_action", callId: callIds[action.callUUID] ?? action.callUUID.uuidString)
     do {
       try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .defaultToSpeaker])
       expectConnection(action.callUUID)
@@ -211,6 +296,7 @@ private final class VoipCallCenter: NSObject, PKPushRegistryDelegate, CXProvider
   }
 
   func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
+    recordStage("native_end_action", callId: callIds[action.callUUID] ?? action.callUUID.uuidString)
     emit(["type": "end"].merging(details(action.callUUID)) { _, new in new })
     watchdogs.removeValue(forKey: action.callUUID)?.cancel()
     callIds.removeValue(forKey: action.callUUID)
@@ -226,12 +312,14 @@ private final class VoipCallCenter: NSObject, PKPushRegistryDelegate, CXProvider
 
   func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
     audioActivated = true
+    for callId in callIds.values { recordStage("native_audio_activated", callId: callId) }
     RTCAudioSession.sharedInstance().audioSessionDidActivate(audioSession)
     emit(["type": "audioActivated"])
   }
 
   func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
     audioActivated = false
+    for callId in callIds.values { recordStage("native_audio_deactivated", callId: callId) }
     RTCAudioSession.sharedInstance().audioSessionDidDeactivate(audioSession)
     emit(["type": "audioDeactivated"])
   }
@@ -274,6 +362,10 @@ public class VoipCallModule: Module {
 
     AsyncFunction("isAudioActivated") { () -> Bool in
       VoipCallCenter.shared.isAudioActivated()
+    }.runOnQueue(.main)
+
+    AsyncFunction("recordStage") { (callId: String, stage: String) in
+      VoipCallCenter.shared.recordStage(stage, callId: callId)
     }.runOnQueue(.main)
 
     AsyncFunction("startOutgoing") { (callId: String, displayName: String, promise: Promise) in

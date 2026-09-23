@@ -3,7 +3,7 @@ import type { VoiceTransport } from "./voice-transport.native";
 
 export type { VoiceTransport };
 
-export async function createVoiceTransport(): Promise<VoiceTransport> {
+export async function createVoiceTransport(_callId?: string): Promise<VoiceTransport> {
   if (!navigator.mediaDevices?.getUserMedia)
     throw new Error("This browser cannot start a voice call.");
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });

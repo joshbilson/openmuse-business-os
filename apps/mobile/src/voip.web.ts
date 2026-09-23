@@ -1,6 +1,6 @@
-import type { VoipEvent } from "./voip.native";
+import type { VoipDiagnosticStage, VoipEvent } from "./voip.native";
 
-export type { VoipEvent };
+export type { VoipDiagnosticStage, VoipEvent };
 export const voip = {
   supported: false,
   subscribe(_listener: (event: VoipEvent) => void) {
@@ -9,6 +9,7 @@ export const voip = {
   drainEvents: async (): Promise<VoipEvent[]> => [],
   getToken: async (): Promise<string | null> => null,
   isAudioActivated: async () => false,
+  recordStage: async (_callId: string, _stage: VoipDiagnosticStage) => {},
   startOutgoing: async (_callId: string, _name: string) => {},
   endCall: async (_callId: string) => {},
   answerCall: async (_callId: string) => {},

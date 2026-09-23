@@ -73,6 +73,7 @@ export function VoiceCallWidget({
     async (requestNativeEnd: boolean, retryReason?: string) => {
       const previous = current.current;
       if (!previous) return;
+      void voip.recordStage(previous.id, "js_finish_started").catch(() => {});
       update(null);
       setRetry(retryReason ? { threadId: previous.threadId, reason: retryReason } : null);
       connecting.current = false;
@@ -102,6 +103,7 @@ export function VoiceCallWidget({
                 .catch(() => {});
           });
       }
+      void voip.recordStage(previous.id, "js_finish_complete").catch(() => {});
     },
     [api, update],
   );
@@ -113,9 +115,11 @@ export function VoiceCallWidget({
       update({ ...target, phase: "connecting", answered: true });
       let media: VoiceTransport | null = null;
       try {
+        void voip.recordStage(target.id, "js_audio_wait_start").catch(() => {});
         await waitForCallAudio();
+        void voip.recordStage(target.id, "js_audio_wait_ready").catch(() => {});
         if (current.current?.id !== target.id) return;
-        media = await createVoiceTransport();
+        media = await createVoiceTransport(target.id);
         if (current.current?.id !== target.id) {
           media.close();
           return;
@@ -139,11 +143,13 @@ export function VoiceCallWidget({
           if (health.current?.callId === target.id) monitor.media(state);
         });
         if (current.current?.id !== target.id) return;
+        void voip.recordStage(target.id, "js_session_request").catch(() => {});
         const session = await api.request<VoiceSession>("/api/voice/sessions", {
           sdp: media.offer,
           threadId: target.threadId,
           callId: target.id,
         });
+        void voip.recordStage(target.id, "js_session_response").catch(() => {});
         sessionId.current = session.sessionId;
         if (current.current?.id !== target.id) {
           media.close();
@@ -157,6 +163,7 @@ export function VoiceCallWidget({
           return;
         }
         await media.accept(session.sdp);
+        void voip.recordStage(target.id, "js_media_ready").catch(() => {});
         if (current.current?.id !== target.id) return;
         if (voip.supported) await voip.reportConnected(target.id);
         update({
@@ -169,6 +176,7 @@ export function VoiceCallWidget({
         const bluetoothAvailable = await voip.hasBluetooth();
         if (current.current?.id === target.id) setBluetooth(bluetoothAvailable);
       } catch (error) {
+        void voip.recordStage(target.id, "js_connect_error").catch(() => {});
         media?.close();
         if (current.current?.id === target.id) {
           const reason = error instanceof Error ? error.message : String(error);
@@ -177,6 +185,7 @@ export function VoiceCallWidget({
         }
       } finally {
         connecting.current = false;
+        void voip.recordStage(target.id, "js_connect_finished").catch(() => {});
       }
     },
     [api, finish, notify, update],
@@ -184,6 +193,7 @@ export function VoiceCallWidget({
 
   const answer = useCallback(
     async (target: Call) => {
+      void voip.recordStage(target.id, "js_answer_received").catch(() => {});
       if (target.answered || current.current?.id !== target.id) return;
       try {
         // A stale or withdrawn push must not start a microphone session.
@@ -193,7 +203,9 @@ export function VoiceCallWidget({
         if (current.current?.id !== target.id) return;
         if (!canAnswerInvitation(invitation))
           throw new Error("This call has expired or was already handled.");
+        void voip.recordStage(target.id, "js_answer_request").catch(() => {});
         await api.request(`/api/voice/calls/${encodeURIComponent(target.id)}/answer`, {}, "POST");
+        void voip.recordStage(target.id, "js_answer_response").catch(() => {});
         if (current.current?.id !== target.id) return;
         await connect({ ...target, answered: true });
       } catch (error) {
