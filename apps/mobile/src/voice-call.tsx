@@ -4,6 +4,7 @@ import { ActivityIndicator, Modal, Pressable, Text, View } from "react-native";
 import type { MuseApi } from "./api";
 import { registerIosPush } from "./device-registration";
 import { colors } from "./ui";
+import { endVoiceCallInParallel } from "./voice-cleanup";
 import { VoiceCallHealth } from "./voice-health";
 import { canAnswerInvitation, type VoiceInvitation } from "./voice-invitation";
 import { createVoiceTransport, type VoiceTransport } from "./voice-transport";
@@ -86,23 +87,25 @@ export function VoiceCallWidget({
       setMuted(false);
       setSpeaker(false);
       setBluetooth(false);
-      if (requestNativeEnd && voip.supported) {
-        await voip.endCall(previous.id).catch(() => {});
-      }
-      if (previous.incoming && !previous.answered) {
-        await api
-          .request(`/api/voice/calls/${encodeURIComponent(previous.id)}/decline`, {}, "POST")
-          .catch(() => {});
-      } else {
-        await api
-          .request(`/api/voice/calls/${encodeURIComponent(previous.id)}/end`, {}, "POST")
-          .catch(async () => {
-            if (id)
-              await api
-                .request(`/api/voice/sessions/${encodeURIComponent(id)}`, undefined, "DELETE")
-                .catch(() => {});
-          });
-      }
+      await endVoiceCallInParallel(
+        () => (requestNativeEnd && voip.supported ? voip.endCall(previous.id) : Promise.resolve()),
+        async () => {
+          if (previous.incoming && !previous.answered) {
+            await api
+              .request(`/api/voice/calls/${encodeURIComponent(previous.id)}/decline`, {}, "POST")
+              .catch(() => {});
+          } else {
+            await api
+              .request(`/api/voice/calls/${encodeURIComponent(previous.id)}/end`, {}, "POST")
+              .catch(async () => {
+                if (id)
+                  await api
+                    .request(`/api/voice/sessions/${encodeURIComponent(id)}`, undefined, "DELETE")
+                    .catch(() => {});
+              });
+          }
+        },
+      );
       void voip.recordStage(previous.id, "js_finish_complete").catch(() => {});
     },
     [api, update],
