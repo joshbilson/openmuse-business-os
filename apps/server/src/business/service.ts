@@ -32,6 +32,8 @@ interface OAuthState {
   generation: string;
   expiresAt: number;
   verifier: string;
+  /** Hash of the OpenMuse bearer session that started a manual handoff. */
+  sessionBinding?: string;
 }
 
 export interface BusinessOptions {
@@ -270,7 +272,7 @@ export class BusinessService {
     }
   }
 
-  async startOAuth(owner: string, provider: BusinessProvider) {
+  async startOAuth(owner: string, provider: BusinessProvider, sessionBinding?: string) {
     if (provider === "google") return new GoogleAuth(this.db, this.config).connect(owner, false);
     if (!this.configured(provider))
       throw new AppError(`${provider} OAuth app is not configured`, 503);
@@ -290,6 +292,8 @@ export class BusinessService {
       throw new AppError("Xero OAuth requires HTTPS or localhost", 503);
     if (provider === "revolut" && !this.config.publicUrl.startsWith("https://"))
       throw new AppError("Revolut OAuth requires an HTTPS callback domain", 503);
+    if (provider === "revolut" && !sessionBinding)
+      throw new AppError("Sign in again before connecting Revolut", 401);
     const state = randomBytes(32).toString("base64url");
     const verifier = randomBytes(48).toString("base64url");
     const generation = await this.rotate(owner, provider);
@@ -299,6 +303,7 @@ export class BusinessService {
       provider,
       generation,
       verifier,
+      ...(provider === "revolut" ? { sessionBinding } : {}),
       expiresAt: this.now() + 10 * 60_000,
     });
     let url: URL;
@@ -338,6 +343,25 @@ export class BusinessService {
       }).toString();
     }
     return { url: url.toString() };
+  }
+
+  /** Recover an in-progress Revolut handoff after returning from the system browser. */
+  async pendingRevolut(owner: string, sessionBinding: string) {
+    const connection = await this.connectionRecord(owner, "revolut");
+    if (!connection) return { state: null, callbackUrl: this.redirect("revolut") };
+    const pending = (await this.db.list<OAuthState>("system", "business-oauth")).find(
+      (item) =>
+        item.owner === owner &&
+        item.provider === "revolut" &&
+        item.sessionBinding === sessionBinding &&
+        item.generation === connection.generation &&
+        item.expiresAt > this.now(),
+    );
+    return {
+      state: pending?.id ?? null,
+      expiresAt: pending?.expiresAt,
+      callbackUrl: this.redirect("revolut"),
+    };
   }
 
   private async revolutAssertion(): Promise<string> {
@@ -477,10 +501,24 @@ export class BusinessService {
   }
 
   /** Authenticated code completion for providers whose redirect does not echo OAuth state. */
-  async completeOAuth(owner: string, provider: BusinessProvider, stateId: string, code: string) {
+  async completeOAuth(
+    owner: string,
+    provider: BusinessProvider,
+    stateId: string,
+    code: string,
+    sessionBinding: string,
+  ) {
+    if (provider !== "revolut")
+      throw new AppError("Use the provider callback for this connection", 422);
     const state = await this.db.get<OAuthState>("system", "business-oauth", stateId);
-    if (!state || state.owner !== owner || state.provider !== provider)
-      throw new AppError("Business sign-in state does not match this owner", 403);
+    if (
+      !state ||
+      state.owner !== owner ||
+      state.provider !== provider ||
+      !state.sessionBinding ||
+      state.sessionBinding !== sessionBinding
+    )
+      throw new AppError("Business sign-in state does not match this session", 403);
     return this.oauthCallback(provider, stateId, code);
   }
 

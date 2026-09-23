@@ -1,7 +1,9 @@
 import { CircleDollarSign, Link2, Mail, RefreshCw, Wallet } from "lucide-react-native";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Linking, Text, View } from "react-native";
-import { Button, Card, colors, ErrorNotice, LinkRow, Sheet, s } from "./ui";
+import { API_URL } from "./api";
+import { parseRevolutHandoff } from "./revolut-handoff";
+import { Button, Card, colors, ErrorNotice, Field, LinkRow, Sheet, s } from "./ui";
 import { useWorkspace } from "./workspace";
 
 type Provider = "square" | "xero" | "revolut" | "google";
@@ -15,6 +17,7 @@ type Connection = {
   lastSyncAt?: string;
   tenants?: { id: string; name: string }[];
 };
+type RevolutPending = { state: string | null; callbackUrl: string; expiresAt?: number };
 
 const providers = [
   { id: "square", name: "Square", icon: CircleDollarSign },
@@ -39,6 +42,9 @@ export function BusinessConnections({ query = "" }: { query?: string }) {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [pendingRevolut, setPendingRevolut] = useState<RevolutPending>();
+  const [revolutReturn, setRevolutReturn] = useState("");
+  const pendingRequest = useRef(0);
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
@@ -52,6 +58,23 @@ export function BusinessConnections({ query = "" }: { query?: string }) {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+  useEffect(() => {
+    if (selected !== "revolut") return;
+    let active = true;
+    const request = ++pendingRequest.current;
+    void api
+      .request<RevolutPending>("/api/business/connections/revolut/pending")
+      .then((pending) => {
+        if (active && request === pendingRequest.current) setPendingRevolut(pending);
+      })
+      .catch((failure) => {
+        if (active && request === pendingRequest.current)
+          setError(failure instanceof Error ? failure.message : String(failure));
+      });
+    return () => {
+      active = false;
+    };
+  }, [api, selected]);
 
   const action = async (work: () => Promise<void>) => {
     setBusy(true);
@@ -67,14 +90,40 @@ export function BusinessConnections({ query = "" }: { query?: string }) {
   };
   const connect = (provider: Provider) =>
     action(async () => {
+      if (provider === "revolut") pendingRequest.current++;
       const result = await api.request<{ url?: string | null }>(
         `/api/business/connections/${provider}/connect`,
         {},
       );
       if (result.url) {
+        if (provider === "revolut") {
+          const pending = await api.request<RevolutPending>(
+            "/api/business/connections/revolut/pending",
+          );
+          if (!pending.state) throw new Error("Revolut connection expired. Start again.");
+          setPendingRevolut(pending);
+          setRevolutReturn("");
+        }
         await Linking.openURL(result.url);
         notify("Finish connecting in your browser, then refresh this connection.");
       }
+    });
+  const completeRevolut = () =>
+    action(async () => {
+      if (!pendingRevolut?.state) throw new Error("Start a Revolut connection first.");
+      const code = parseRevolutHandoff(
+        revolutReturn,
+        pendingRevolut.callbackUrl || `${API_URL}/api/business/oauth/revolut/callback`,
+        pendingRevolut.state,
+      );
+      await api.request("/api/business/connections/revolut/complete", {
+        state: pendingRevolut.state,
+        code,
+      });
+      pendingRequest.current++;
+      setPendingRevolut(undefined);
+      setRevolutReturn("");
+      notify("Revolut account identity checked with the provider.");
     });
   const verify = (provider: Provider) =>
     action(async () => {
@@ -140,6 +189,30 @@ export function BusinessConnections({ query = "" }: { query?: string }) {
               <Text style={s.muted}>
                 Add this provider’s app credentials on Oracle before connecting.
               </Text>
+            )}
+            {selected === "revolut" && pendingRevolut?.state && (
+              <View style={{ gap: 10 }}>
+                <Text style={s.muted}>
+                  If Revolut returns to a page asking you to finish in OpenMuse, copy that page’s
+                  address and paste it here within two minutes of approval. You can also paste only
+                  the authorization code.
+                </Text>
+                <Field
+                  label="Revolut return address or code"
+                  value={revolutReturn}
+                  onChangeText={setRevolutReturn}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  autoComplete="off"
+                />
+                <Button
+                  busy={busy}
+                  disabled={!revolutReturn.trim()}
+                  onPress={() => void completeRevolut()}
+                >
+                  Finish Revolut connection
+                </Button>
+              </View>
             )}
             {chosen && chosen.status !== "unconfigured" && (
               <Button busy={busy} onPress={() => void verify(selected)}>

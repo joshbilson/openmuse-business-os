@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Hono } from "hono";
 import { z } from "zod";
 import { publishBusinessViewSchema } from "../../../../packages/domain/src/business-view.ts";
@@ -20,6 +21,11 @@ const kindSchema = z.enum([
   "mail",
 ]);
 const owner = (c: { get: (key: "owner") => string }) => c.get("owner");
+function sessionBinding(authorization?: string): string {
+  const token = /^Bearer ([A-Za-z0-9_-]{43})$/.exec(authorization ?? "")?.[1];
+  if (!token) throw new AppError("Sign in again before connecting Revolut", 401);
+  return createHash("sha256").update(token).digest("hex");
+}
 
 /** Mount behind the application's existing /api bearer-session middleware. */
 export function businessRoutes(service: BusinessService, views?: BusinessViews) {
@@ -33,7 +39,18 @@ export function businessRoutes(service: BusinessService, views?: BusinessViews) 
     c.json(await service.verify(owner(c), providerSchema.parse(c.req.param("provider")))),
   );
   router.post("/connections/:provider/connect", async (c) =>
-    c.json(await service.startOAuth(owner(c), providerSchema.parse(c.req.param("provider")))),
+    c.json(
+      await service.startOAuth(
+        owner(c),
+        providerSchema.parse(c.req.param("provider")),
+        c.req.param("provider") === "revolut"
+          ? sessionBinding(c.req.header("authorization"))
+          : undefined,
+      ),
+    ),
+  );
+  router.get("/connections/revolut/pending", async (c) =>
+    c.json(await service.pendingRevolut(owner(c), sessionBinding(c.req.header("authorization")))),
   );
   router.post("/connections/square/token", async (c) => {
     const { token } = z.object({ token: z.string().min(1).max(4096) }).parse(await c.req.json());
@@ -45,10 +62,19 @@ export function businessRoutes(service: BusinessService, views?: BusinessViews) 
   });
   router.post("/connections/:provider/complete", async (c) => {
     const provider = providerSchema.parse(c.req.param("provider"));
+    if (provider !== "revolut") throw new AppError("Use the provider callback", 422);
     const { state, code } = z
       .object({ state: z.string().min(20).max(256), code: z.string().min(1).max(4096) })
       .parse(await c.req.json());
-    return c.json(await service.completeOAuth(owner(c), provider, state, code));
+    return c.json(
+      await service.completeOAuth(
+        owner(c),
+        provider,
+        state,
+        code,
+        sessionBinding(c.req.header("authorization")),
+      ),
+    );
   });
   router.post("/connections/:provider/disconnect", async (c) =>
     c.json(await service.disconnect(owner(c), providerSchema.parse(c.req.param("provider")))),
@@ -95,6 +121,20 @@ export function businessCallbackRoutes(service: BusinessService) {
     const provider = providerSchema.parse(c.req.param("provider"));
     const state = c.req.query("state"),
       code = c.req.query("code");
+    // Revolut completion always passes through the authenticated, session-bound
+    // handoff. A provider-supplied state must not bypass that binding.
+    if (provider === "revolut" && code)
+      return new Response(
+        '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Finish Revolut connection</title></head><body><h1>Finish connecting Revolut</h1><p>Copy this page\'s address and paste it into your pending Revolut connection in OpenMuse within two minutes of approval.</p><p>The address contains a temporary authorization code. Keep it private.</p></body></html>',
+        {
+          headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "Content-Security-Policy": "default-src 'none'",
+          },
+        },
+      );
     if (!state || !code) throw new AppError("Business authorization callback is incomplete", 400);
     await service.oauthCallback(provider, state, code);
     return c.html(

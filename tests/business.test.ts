@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,12 +9,13 @@ import { providerJson } from "../apps/server/src/business/http.ts";
 import { createBusinessMcpBridge } from "../apps/server/src/business/mcp-server.ts";
 import { BusinessObserver } from "../apps/server/src/business/observer.ts";
 import { readProviderPage } from "../apps/server/src/business/providers.ts";
-import { businessRoutes } from "../apps/server/src/business/routes.ts";
+import { businessCallbackRoutes, businessRoutes } from "../apps/server/src/business/routes.ts";
 import { BusinessService } from "../apps/server/src/business/service.ts";
 import { businessTools } from "../apps/server/src/business/tools.ts";
 import type { BusinessConnection } from "../apps/server/src/business/types.ts";
 import type { Config } from "../apps/server/src/config.ts";
 import { createStore, type Store } from "../apps/server/src/db.ts";
+import { AppError } from "../apps/server/src/errors.ts";
 
 let store: Store;
 let directory: string;
@@ -408,7 +409,7 @@ test("Revolut uses a signed short-lived assertion and account/transaction reads"
       ]);
     },
   });
-  const { url } = await service.startOAuth("owner-revolut", "revolut");
+  const { url } = await service.startOAuth("owner-revolut", "revolut", "test-session");
   const state = new URL(url).searchParams.get("state") ?? "";
   const status = await service.oauthCallback("revolut", state, "code-2");
   assert.equal(status.status, "verified");
@@ -418,6 +419,124 @@ test("Revolut uses a signed short-lived assertion and account/transaction reads"
   const [transaction] = await service.entities("owner-revolut", { kind: "transaction" });
   assert.deepEqual(balance.money, { decimal: "3171.89", currency: "AUD" });
   assert.deepEqual(transaction.money, { decimal: "-31.24", currency: "AUD" });
+});
+
+test("Revolut manual handoff is bound to the owner and bearer session, then consumed once", async () => {
+  const keyPath = join(directory, "revolut-handoff-private.pem");
+  const pair = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  await writeFile(keyPath, pair.privateKey.export({ type: "pkcs8", format: "pem" }), {
+    mode: 0o600,
+  });
+  let now = Date.parse("2026-09-24T12:00:00Z");
+  let exchanges = 0;
+  const service = new BusinessService(store, config, {
+    revolutClientId: "revolut-handoff-client",
+    revolutPrivateKeyFile: keyPath,
+    now: () => now,
+    fetcher: async (input, init) => {
+      const url = new URL(request(input, init).url);
+      if (url.pathname === "/api/1.0/auth/token") {
+        exchanges++;
+        return json({ access_token: "synthetic-access", refresh_token: "synthetic-refresh" });
+      }
+      assert.equal(url.pathname, "/api/1.0/accounts");
+      return json([{ id: "synthetic-account", balance: 0, currency: "AUD" }]);
+    },
+  });
+  const app = new Hono<{ Variables: { owner: string } }>();
+  app.onError((error, c) => {
+    if (error instanceof AppError) return c.json({ error: error.message }, error.status);
+    throw error;
+  });
+  app.use("*", async (c, next) => {
+    c.set("owner", "owner-handoff");
+    await next();
+  });
+  app.route("/api/business", businessCallbackRoutes(service));
+  app.route("/api/business", businessRoutes(service));
+  const bearerA = `Bearer ${"a".repeat(43)}`;
+  const bearerB = `Bearer ${"b".repeat(43)}`;
+  const connect = await app.request("/api/business/connections/revolut/connect", {
+    method: "POST",
+    headers: { Authorization: bearerA },
+  });
+  assert.equal(connect.status, 200);
+  const { url } = (await connect.json()) as { url: string };
+  const state = new URL(url).searchParams.get("state") ?? "";
+  const pendingA = await app.request("/api/business/connections/revolut/pending", {
+    headers: { Authorization: bearerA },
+  });
+  assert.equal(((await pendingA.json()) as { state: string }).state, state);
+  const pendingB = await app.request("/api/business/connections/revolut/pending", {
+    headers: { Authorization: bearerB },
+  });
+  assert.equal(((await pendingB.json()) as { state: string | null }).state, null);
+
+  const codeOnly = await app.request("/api/business/oauth/revolut/callback?code=synthetic-once");
+  assert.equal(codeOnly.status, 200);
+  assert.equal(codeOnly.headers.get("cache-control"), "no-store");
+  assert.equal(codeOnly.headers.get("referrer-policy"), "no-referrer");
+  assert.equal((await codeOnly.text()).includes("synthetic-once"), false);
+  const withState = await app.request(
+    `/api/business/oauth/revolut/callback?code=synthetic-once&state=${state}`,
+  );
+  assert.equal(withState.status, 200);
+  assert.equal((await withState.text()).includes("synthetic-once"), false);
+  assert.equal(exchanges, 0);
+  const body = JSON.stringify({ state, code: "synthetic-once" });
+  const wrongSession = await app.request("/api/business/connections/revolut/complete", {
+    method: "POST",
+    headers: { Authorization: bearerB, "Content-Type": "application/json" },
+    body,
+  });
+  assert.equal(wrongSession.status, 403);
+  await assert.rejects(
+    service.completeOAuth(
+      "another-owner",
+      "revolut",
+      state,
+      "synthetic-once",
+      createHash("sha256").update("a".repeat(43)).digest("hex"),
+    ),
+    /does not match this session/,
+  );
+  assert.equal(exchanges, 0);
+
+  const complete = await app.request("/api/business/connections/revolut/complete", {
+    method: "POST",
+    headers: { Authorization: bearerA, "Content-Type": "application/json" },
+    body,
+  });
+  assert.equal(complete.status, 200);
+  assert.equal(((await complete.json()) as { status: string }).status, "verified");
+  assert.equal(exchanges, 1);
+  const replay = await app.request("/api/business/connections/revolut/complete", {
+    method: "POST",
+    headers: { Authorization: bearerA, "Content-Type": "application/json" },
+    body,
+  });
+  assert.equal(replay.status, 403);
+  assert.equal(exchanges, 1);
+  const noPending = await app.request("/api/business/connections/revolut/pending", {
+    headers: { Authorization: bearerA },
+  });
+  assert.equal(((await noPending.json()) as { state: string | null }).state, null);
+
+  const expired = await app.request("/api/business/connections/revolut/connect", {
+    method: "POST",
+    headers: { Authorization: bearerA },
+  });
+  const expiredState = new URL(((await expired.json()) as { url: string }).url).searchParams.get(
+    "state",
+  );
+  now += 10 * 60_000 + 1;
+  const tooLate = await app.request("/api/business/connections/revolut/complete", {
+    method: "POST",
+    headers: { Authorization: bearerA, "Content-Type": "application/json" },
+    body: JSON.stringify({ state: expiredState, code: "synthetic-late" }),
+  });
+  assert.equal(tooLate.status, 400);
+  assert.equal(exchanges, 1);
 });
 
 test("GET retries rate limits but token exchanges never retry", async () => {
