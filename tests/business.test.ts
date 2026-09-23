@@ -4,11 +4,14 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
+import { Hono } from "hono";
 import { providerJson } from "../apps/server/src/business/http.ts";
 import { createBusinessMcpBridge } from "../apps/server/src/business/mcp-server.ts";
 import { BusinessObserver } from "../apps/server/src/business/observer.ts";
 import { readProviderPage } from "../apps/server/src/business/providers.ts";
+import { businessRoutes } from "../apps/server/src/business/routes.ts";
 import { BusinessService } from "../apps/server/src/business/service.ts";
+import { businessTools } from "../apps/server/src/business/tools.ts";
 import type { BusinessConnection } from "../apps/server/src/business/types.ts";
 import type { Config } from "../apps/server/src/config.ts";
 import { createStore, type Store } from "../apps/server/src/db.ts";
@@ -90,6 +93,85 @@ test("Square token verification is a real merchant GET and sync keeps exact mino
   assert.equal(saved.evidence.endpoint, "/v2/payments");
   assert.equal(saved.evidence.fetchedAt, "2026-09-23T12:00:00.000Z");
   assert.equal(calls.length, 3);
+});
+
+test("source-time entity sorting precedes the limit and leaves missing times last", async () => {
+  const owner = "owner-source-time-sort";
+  const connectionId = "source-time-connection";
+  await store.put(owner, "business-connections", {
+    id: "square",
+    provider: "square",
+    connectionId,
+    generation: "one",
+    credential: null,
+    credentialSource: "environment",
+    status: "verified",
+  });
+  const fact = (name: string, times: { occurredAt?: string; sourceUpdatedAt?: string } = {}) => ({
+    id: `square:payment:${name}`,
+    provider: "square" as const,
+    kind: "payment" as const,
+    connectionId,
+    sourceId: name,
+    title: `Payment ${name}`,
+    observedAt: "2026-09-23T12:00:00Z",
+    evidence: { endpoint: "/v2/payments", sourceId: name, fetchedAt: "2026-09-23T12:00:00Z" },
+    ...times,
+  });
+  // Cache write order deliberately puts the undated fact first in the default list.
+  for (const record of [
+    fact("b", { occurredAt: "2026-09-23T10:00:00Z" }),
+    fact("a", { occurredAt: "2026-09-23T10:00:00+00:00" }),
+    fact("old", { occurredAt: "2026-09-21T10:00:00Z" }),
+    fact("fallback", { sourceUpdatedAt: "2026-09-22T10:00:00Z" }),
+    fact("unzone", {
+      occurredAt: "2026-09-24T10:00:00",
+      sourceUpdatedAt: "2026-09-20T10:00:00Z",
+    }),
+    fact("missing"),
+  ])
+    await store.put(owner, "business-facts", record);
+  const service = new BusinessService(store, config);
+  const names = (facts: { sourceId: string }[]) => facts.map((item) => item.sourceId);
+  assert.deepEqual(
+    names(await service.entities(owner, { provider: "square", kind: "payment", sort: "newest" })),
+    ["a", "b", "fallback", "old", "unzone", "missing"],
+  );
+  assert.deepEqual(
+    names(await service.entities(owner, { provider: "square", kind: "payment", sort: "oldest" })),
+    ["unzone", "old", "fallback", "a", "b", "missing"],
+  );
+  assert.deepEqual(
+    names(
+      await service.entities(owner, {
+        provider: "square",
+        kind: "payment",
+        sort: "newest",
+        limit: 1,
+      }),
+    ),
+    ["a"],
+  );
+  assert.deepEqual(
+    names(await service.entities(owner, { provider: "square", kind: "payment", limit: 1 })),
+    ["missing"],
+  );
+  assert.equal(
+    businessTools(service)["business.entities"].schema.safeParse({ sort: "recent" }).success,
+    false,
+  );
+
+  const app = new Hono<{ Variables: { owner: string } }>();
+  app.use("*", async (c, next) => {
+    c.set("owner", owner);
+    await next();
+  });
+  app.route("/api/business", businessRoutes(service));
+  const response = await app.request(
+    "/api/business/entities?provider=square&kind=payment&sort=newest&limit=1",
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(names(await response.json()), ["a"]);
 });
 
 test("Square payment paging visits every merchant location rather than only the main one", async () => {
@@ -442,6 +524,28 @@ test("Hermes MCP bridge discovers tools and uses only an owner-authenticated bus
   });
   assert.equal((invalid as { result: { isError: boolean } }).result.isError, true);
   assert.equal(calls.length, 2);
+  const sorted = await bridge.handle({
+    jsonrpc: "2.0",
+    id: 5,
+    method: "tools/call",
+    params: {
+      name: "business_entities",
+      arguments: { provider: "square", kind: "payment", sort: "newest", limit: 1 },
+    },
+  });
+  assert.equal((sorted as { result: { isError?: boolean } }).result.isError, undefined);
+  const entityUrl = new URL(calls.at(-1)?.url ?? "https://missing.test");
+  assert.equal(entityUrl.pathname, "/api/business/entities");
+  assert.equal(entityUrl.searchParams.get("sort"), "newest");
+  assert.equal(entityUrl.searchParams.get("limit"), "1");
+  const invalidSort = await bridge.handle({
+    jsonrpc: "2.0",
+    id: 6,
+    method: "tools/call",
+    params: { name: "business_entities", arguments: { sort: "recent" } },
+  });
+  assert.equal((invalidSort as { result: { isError: boolean } }).result.isError, true);
+  assert.equal(calls.length, 3);
 });
 
 test("business observer baselines new sources and routes changed facts to Hermes agent tasks", async () => {

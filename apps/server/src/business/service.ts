@@ -1,5 +1,6 @@
 import { createHash, createSign, randomBytes, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { z } from "zod";
 import { decryptSecret, encryptSecret } from "../../../../packages/integrations/src/vault.ts";
 import type { Config } from "../config.ts";
 import type { Store } from "../db.ts";
@@ -84,6 +85,7 @@ const xeroRequiredScopes: Record<BusinessKind, readonly string[]> = {
   transaction: [],
   mail: [],
 };
+const sourceTimestampSchema = z.iso.datetime({ offset: true });
 
 export class BusinessService {
   private readonly fetcher: Fetcher;
@@ -741,7 +743,12 @@ export class BusinessService {
 
   async entities(
     owner: string,
-    filters: { provider?: BusinessProvider; kind?: BusinessKind; limit?: number },
+    filters: {
+      provider?: BusinessProvider;
+      kind?: BusinessKind;
+      limit?: number;
+      sort?: "newest" | "oldest";
+    },
   ) {
     const facts = await this.db.list<BusinessFact>(owner, "business-facts");
     const current = new Map<BusinessProvider, string>();
@@ -760,6 +767,27 @@ export class BusinessService {
         (!filters.provider || fact.provider === filters.provider) &&
         (!filters.kind || fact.kind === filters.kind),
     );
+    if (filters.sort) {
+      const sourceTime = (fact: BusinessFact) => {
+        for (const value of [fact.occurredAt, fact.sourceUpdatedAt]) {
+          // An offset is required: an unzoned business date is not an instant.
+          if (!value || !sourceTimestampSchema.safeParse(value).success) continue;
+          const instant = Date.parse(value);
+          if (Number.isFinite(instant)) return instant;
+        }
+        return null;
+      };
+      const times = new Map(filtered.map((fact) => [fact.id, sourceTime(fact)]));
+      filtered.sort((a, b) => {
+        const aTime = times.get(a.id) ?? null;
+        const bTime = times.get(b.id) ?? null;
+        if (aTime === null && bTime !== null) return 1;
+        if (aTime !== null && bTime === null) return -1;
+        if (aTime !== null && bTime !== null && aTime !== bTime)
+          return filters.sort === "newest" ? bTime - aTime : aTime - bTime;
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      });
+    }
     return filtered.slice(0, Math.min(filters.limit ?? 100, 500));
   }
 

@@ -40,15 +40,21 @@ export function businessTools(service: BusinessService) {
     },
     "business.entities": {
       description:
-        "Read up to 500 saved provider facts. Amounts and currencies retain provider provenance.",
+        "Read up to 500 saved provider facts. For latest/earliest by source event time, set sort to newest/oldest before limit. Without sort, cache write order is not source chronology. Amounts and currencies retain provider provenance.",
       schema: z.object({
         provider: provider.optional(),
         kind: kind.optional(),
         limit: z.number().int().min(1).max(500).optional(),
+        sort: z.enum(["newest", "oldest"]).optional(),
       }),
       run: (
         owner: string,
-        input: { provider?: z.infer<typeof provider>; kind?: z.infer<typeof kind>; limit?: number },
+        input: {
+          provider?: z.infer<typeof provider>;
+          kind?: z.infer<typeof kind>;
+          limit?: number;
+          sort?: "newest" | "oldest";
+        },
       ) => service.entities(owner, input),
     },
   };

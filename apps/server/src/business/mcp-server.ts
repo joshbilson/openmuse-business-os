@@ -29,7 +29,8 @@ const tools = [
   },
   {
     name: "business_entities",
-    description: "Read saved provider facts. Amounts preserve the provider currency and units.",
+    description:
+      "Read saved provider facts. To select the most recent payment, pass provider=square, kind=payment, sort=newest, limit=1; the limit is applied after sorting by occurredAt (or sourceUpdatedAt). Missing or unzoned times are last. Without sort, cache write order is not source chronology. Sync first when fresh provider data is needed. Amounts preserve provider currency and units.",
     inputSchema: {
       type: "object",
       properties: {
@@ -50,6 +51,7 @@ const tools = [
           ],
         },
         limit: { type: "integer", minimum: 1, maximum: 500 },
+        sort: { type: "string", enum: ["newest", "oldest"] },
       },
       additionalProperties: false,
     },
@@ -112,6 +114,7 @@ const toolSchemas: Record<string, z.ZodType> = {
     provider: provider.optional(),
     kind: kind.optional(),
     limit: z.number().int().min(1).max(500).optional(),
+    sort: z.enum(["newest", "oldest"]).optional(),
   }),
   business_sync: z.strictObject({ provider, kind, cursor: z.string().max(2048).optional() }),
 };
@@ -195,7 +198,7 @@ export function createBusinessMcpBridge(options: BusinessMcpOptions) {
     else if (name === "business_connections") data = await request("/api/business/connections");
     else if (name === "business_entities") {
       const url = new URL("/api/business/entities", base);
-      for (const key of ["provider", "kind", "limit"] as const) {
+      for (const key of ["provider", "kind", "limit", "sort"] as const) {
         const value = input[key];
         if (value !== undefined) url.searchParams.set(key, String(value));
       }

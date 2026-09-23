@@ -69,6 +69,7 @@ export function businessRoutes(service: BusinessService, views?: BusinessViews) 
         provider: providerSchema.optional(),
         kind: kindSchema.optional(),
         limit: z.coerce.number().int().min(1).max(500).optional(),
+        sort: z.enum(["newest", "oldest"]).optional(),
       })
       .parse(c.req.query());
     return c.json(await service.entities(owner(c), query));
