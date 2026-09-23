@@ -117,10 +117,30 @@ export function businessRoutes(service: BusinessService, views?: BusinessViews) 
 export function businessCallbackRoutes(service: BusinessService) {
   const router = new Hono();
   router.get("/oauth/:provider/callback", async (c) => {
-    if (c.req.query("error")) throw new AppError("Business authorization was declined", 400);
     const provider = providerSchema.parse(c.req.param("provider"));
     const state = c.req.query("state"),
       code = c.req.query("code");
+    const redirectWithoutCode = (failed = false) =>
+      new Response(null, {
+        status: 302,
+        headers: {
+          Location: failed ? "/?xero_connection=failed" : "/",
+          "Cache-Control": "no-store",
+          "Referrer-Policy": "no-referrer",
+        },
+      });
+    // Even rejected or failed Xero callbacks can contain a code in the URL.
+    // Keep every response on this endpoint bodyless and redirect away from it.
+    if (provider === "xero") {
+      try {
+        if (c.req.query("error") || !state || !code) return redirectWithoutCode(true);
+        await service.oauthCallback(provider, state, code);
+        return redirectWithoutCode();
+      } catch {
+        return redirectWithoutCode(true);
+      }
+    }
+    if (c.req.query("error")) throw new AppError("Business authorization was declined", 400);
     // Revolut completion always passes through the authenticated, session-bound
     // handoff. A provider-supplied state must not bypass that binding.
     if (provider === "revolut" && code)

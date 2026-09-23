@@ -319,7 +319,28 @@ test("Xero OAuth requires choosing one of multiple authorized tenants before a v
     assert.ok(scopes.includes(scope));
   assert.equal(scopes.includes("accounting.transactions.read"), false);
   const state = new URL(url).searchParams.get("state") ?? "";
-  const pending = await service.oauthCallback("xero", state, "code-1");
+  const callbackApp = new Hono().route("/api/business", businessCallbackRoutes(service));
+  const callback = await callbackApp.request(
+    `/api/business/oauth/xero/callback?code=code-1&state=${state}`,
+  );
+  assert.equal(callback.status, 302);
+  assert.equal(callback.headers.get("location"), "/");
+  assert.equal(callback.headers.get("cache-control"), "no-store");
+  assert.equal(callback.headers.get("referrer-policy"), "no-referrer");
+  assert.equal(await callback.text(), "");
+  for (const query of [
+    "code=possibly-sensitive-code",
+    "code=possibly-sensitive-code&state=invalid-state",
+    "error=access_denied&code=possibly-sensitive-code",
+  ]) {
+    const failure = await callbackApp.request(`/api/business/oauth/xero/callback?${query}`);
+    assert.equal(failure.status, 302);
+    assert.equal(failure.headers.get("location"), "/?xero_connection=failed");
+    assert.equal(failure.headers.get("cache-control"), "no-store");
+    assert.equal(failure.headers.get("referrer-policy"), "no-referrer");
+    assert.equal(await failure.text(), "");
+  }
+  const pending = await service.status("owner-xero", "xero");
   assert.equal(pending.status, "needs_selection");
   await assert.rejects(
     service.sync("owner-xero", "xero", "bank_transaction"),
