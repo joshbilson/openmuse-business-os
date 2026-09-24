@@ -1,6 +1,10 @@
   <div align="center">
 
-# OpenMuse
+# OpenMuse Business OS
+
+An owner-operated fork of [CopilotKit/OpenMuse](https://github.com/CopilotKit/openmuse), pinned at `bb7ce4e1c6e523bf282a655c63621e3ed9e75150`. The shipped clients retain the upstream Expo interface, components and navigation. Mac access uses the web app.
+
+Business additions use self-hosted PostgreSQL, Hermes, direct business APIs, local conversation storage, native iOS calling and direct APNs. [Deployment and acceptance status](docs/BUSINESS-OS.md) · [Connections](docs/BUSINESS-CONNECTORS.md) · [Backups](docs/BACKUP-RESTORE.md).
 
 **A personal agent with a browser, terminal, files, and work that keeps going. Compatible with any agent harness.**
 
@@ -9,7 +13,7 @@ Built with CopilotKit React Native for iOS, Android, and web.
 
 [Quick start](#quick-start) · [Demo](#demo) · [Features](#features) · [Architecture](#architecture) · [Docs](docs/README.md) · [Contributing](CONTRIBUTING.md)
 
-[![CI](https://github.com/CopilotKit/OpenMuse/actions/workflows/ci.yml/badge.svg)](https://github.com/CopilotKit/OpenMuse/actions/workflows/ci.yml)
+[![CI](https://github.com/joshbilson/openmuse-business-os/actions/workflows/ci.yml/badge.svg)](https://github.com/joshbilson/openmuse-business-os/actions/workflows/ci.yml)
 [![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Clone this template and customize it however you want.
@@ -26,7 +30,7 @@ Clone this template and customize it however you want.
 
 </div>
 
-> **Alpha, for self-hosting and building on.** Open-ended reasoning, live Google accounts, and CopilotKit Rich Threads require their own configuration. See [what is verified](docs/VERIFICATION.md) and the [roadmap](ROADMAP.md).
+> **Alpha, for self-hosting and building on.** Open-ended reasoning, live Google accounts, and provider access require their own configuration. See [what is verified](docs/VERIFICATION.md) and the [roadmap](ROADMAP.md).
 
 ## Demo
 
@@ -55,22 +59,20 @@ The computer combines **persistent Chromium and an optional Linux workspace**. T
 | **Finance** | Import transaction CSV to create a spending summary with categories, transactions, and a savings-goal action. |
 | **Gmail & Calendar** | Google OAuth adapters, complete mail threads, drafts/attachments, calendar discovery, and reviewed event creation/update/deletion. Live credentials required. |
 | **Personal context** | Editable name, tone, avatar, and memories. Background-update preferences and durable in-app notifications. |
-| **Rich Threads** | CopilotKit Intelligence persistence in every mode, with a stable main conversation, side chats, renaming, archiving, restoring, and replay. A server-only project key is required. |
+| **Rich Threads** | Local PostgreSQL persistence, with a stable main conversation, side chats, renaming, archiving, restoring, and replay. Text and voice share the same history. |
+| **Business views** | Hermes selects cards or tables from verified source records; immutable snapshots retain exact amount strings, account identity, evidence and observation dates inside Apps. |
 
-The [feature inventory](docs/FEATURES.md) describes implemented capabilities and planned extensions. Health/bank/social connectors, device push, voice, generated executable tools, and automatic reservations/payments are on the [roadmap](ROADMAP.md).
+The [feature inventory](docs/FEATURES.md) describes implemented capabilities and planned extensions. This fork adds direct business connectors, iOS push and full-duplex calling. Hardware and account-dependent acceptance is recorded in [BUSINESS-OS.md](docs/BUSINESS-OS.md); upstream future features remain in the [roadmap](ROADMAP.md).
 
 ## Quick start
 
-**Requirements:** Node 24 LTS, pnpm 11.19.0, and a CopilotKit Intelligence project key. The local sample app needs no model, Google account, or Docker.
+**Requirements:** Node 24 LTS and pnpm 11.19.0. The local sample app needs no model, Google account, or Docker.
 
 ```sh
-git clone https://github.com/CopilotKit/OpenMuse.git openmuse
+git clone https://github.com/joshbilson/openmuse-business-os.git openmuse
 cd openmuse
 pnpm install --frozen-lockfile
 cp .env.example .env
-npx copilotkit@latest login
-npx copilotkit@latest project select
-# Set CPK_INTELLIGENCE_API_KEY in .env to the generated server-only project key.
 pnpm dev
 ```
 
@@ -95,11 +97,11 @@ For iOS or Android, use `pnpm --dir apps/mobile ios` or `pnpm --dir apps/mobile 
 
 Copy the commented settings in [.env.example](.env.example) into your private `.env`:
 
-1. Set `AGENT_BACKEND=model`, `MODEL=provider/model-id`, and the matching provider key. CopilotKit supports the configured OpenAI, Anthropic or Google provider. Fictional data can still be used with a real model. Provider keys stay on the server.
-2. Create or select a CopilotKit Intelligence project with `npx copilotkit@latest login` and `npx copilotkit@latest project select`. Keep the generated `CPK_INTELLIGENCE_API_KEY` on the server.
-3. For personal mail/calendar, set `WORKSPACE_MODE=live`, the generated `CPK_INTELLIGENCE_API_KEY`, a random `OPENMUSE_ACCESS_KEY` of at least 24 characters, and `TOKEN_ENCRYPTION_KEY` containing 32 random bytes encoded as base64. Restart the API.
-4. Configure a Google OAuth web client with Gmail and Calendar APIs enabled. Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`; register `${PUBLIC_API_URL}/api/google/callback` as its redirect URI. Configure consent/test-user access in your Google project.
-5. Open **Apps → Gmail** (or **Google Calendar**), connect read access, and grant write access when needed. Every send or calendar change still requires its own stored review. Changing/disconnecting the account invalidates pending connection-bound work.
+1. Configure a private Hermes API and set `AGENT_BACKEND=hermes`, `HERMES_API_URL`, `HERMES_API_KEY`, `HERMES_PROVIDER` and `HERMES_MODEL`. Model providers are selected through Hermes; an unconfigured or different runtime fails explicitly.
+2. Set `WORKSPACE_MODE=live`, `DATABASE_URL`, a random `OPENMUSE_ACCESS_KEY` of at least 24 characters, and `TOKEN_ENCRYPTION_KEY` containing 32 random bytes encoded as base64.
+3. Configure a Google OAuth web client with Gmail and Calendar APIs enabled. Register `${PUBLIC_API_URL}/api/google/callback`, then set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` on Oracle.
+4. Open **Apps** for business connections. Account identity is verified using each provider. Credentials remain on Oracle.
+5. `ACTION_APPROVAL_MODE=standing-authority` records authorization from the owner's standing policy. External actions use durable claims and receipts; uncertain outcomes are never automatically retried.
 
 Google credentials are encrypted at rest. File URLs and browser consoles use short-lived signatures. This deployment uses one owner protected by a shared access key; it is not a multi-tenant authentication system. Use HTTPS and restricted network access for a remote host. Keep the default local-data mode on loopback.
 
@@ -135,11 +137,9 @@ For a separate task worker, configure the same `DATABASE_URL`, secrets and share
 
 No hidden retry occurs after an uncertain external write. Review its provider outcome before creating a replacement. Pausing/cancelling prevents subsequent task steps; an already approved in-flight provider request may finish.
 
-## CopilotKit Rich Threads
+## Local conversations
 
-Every deployment requires `CPK_INTELLIGENCE_API_KEY` on the API server for CopilotKit Intelligence conversation persistence and replay. Create or select a project with `npx copilotkit@latest login` and `npx copilotkit@latest project select`, set the generated server-only key, and restart the API. The native menu uses `useThreads`; rich tool results link back to saved tasks, documents, and browser sessions.
-
-Intelligence is a separate service and is not included in this repository's MIT license. No project key is shipped. [Configuration and validation boundaries](docs/RICH-THREADS.md).
+The original CopilotKit chat interface uses an owner-scoped local AG-UI adapter. Conversations, message history and run events persist in PostgreSQL on Oracle. There is no required hosted Intelligence service or Intelligence project key. Hermes runs have idempotency keys and can be reconciled after reconnecting. [Persistence contract](docs/RICH-THREADS.md).
 
 ## Architecture
 
@@ -147,7 +147,13 @@ Intelligence is a separate service and is not included in this repository's MIT 
 flowchart TD
   Client[Expo / React Native / Web] -->|AG-UI and authenticated API| API[Hono + CopilotKit runtime]
   API --> Tasks[Durable task worker]
-  API --> Threads[CopilotKit Intelligence required in every mode]
+  API --> Threads[Local conversation history]
+  API --> Hermes[Hermes operator]
+  Tasks --> Hermes
+  Hermes --> Business[Xero / Square / Revolut / Google]
+  Client <-->|WebRTC audio| Voice[Full-duplex provider]
+  API -->|Sideband control| Voice
+  API --> APNs[Apple push / incoming calls]
   API --> Store[(PGlite or PostgreSQL)]
   Tasks --> Store
   Tasks --> Review[Stored action review]

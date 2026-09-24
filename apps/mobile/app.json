@@ -7,11 +7,20 @@
     "orientation": "default",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
-    "ios": { "supportsTablet": true, "bundleIdentifier": "app.openmuse.mobile" },
-    "android": { "package": "app.openmuse.mobile" },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "au.com.wineandlarder.openmuse",
+      "appleTeamId": "K5AYLYH9GW"
+    },
+    "android": { "package": "au.com.wineandlarder.openmuse" },
     "web": { "bundler": "metro", "name": "OpenMuse — a little room for everything" },
     "plugins": [
       "expo-document-picker",
+      "expo-notifications",
+      "expo-secure-store",
+      "@config-plugins/react-native-webrtc",
+      ["./plugins/with-voip-call", { "apnsEnvironment": "development" }],
+      "./plugins/with-ios-scene-lifecycle",
       "@config-plugins/react-native-blob-util",
       "@config-plugins/react-native-pdf"
     ]

@@ -34,7 +34,16 @@ export async function readDownloadFailures(directory: string, recoverInterrupted
   for (const name of await readdir(folder)) {
     if (!name.endsWith(".json")) continue;
     const path = join(folder, name);
-    const outcome = JSON.parse(await readFile(path, "utf8")) as Outcome;
+    let contents: string;
+    try {
+      contents = await readFile(path, "utf8");
+    } catch (error) {
+      // A successful transfer removes its pending journal after publishing the
+      // PDF. A concurrent listing may have seen that journal just before rm.
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") continue;
+      throw error;
+    }
+    const outcome = JSON.parse(contents) as Outcome;
     if (outcome.status === "pending" && recoverInterrupted) {
       if (await stat(join(directory, "downloads", `${outcome.id}.json`)).catch(() => null)) {
         await rm(path, { force: true });

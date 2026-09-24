@@ -5,113 +5,163 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { createApp } from "../apps/server/src/app.ts";
 import { createStore } from "../apps/server/src/db.ts";
-import type { ActionProposal } from "../packages/domain/src/index.ts";
-import { fixture as computerFixture } from "./helpers/computer.ts";
-import { modelFixture } from "./helpers/model.ts";
+import { HermesClient } from "../apps/server/src/hermes.ts";
 
-test("CopilotKit model worker executes server tools and persists the confirmed outcome", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "openmuse-model-"));
-  const db = await createStore();
-  const calls: { name: string; arguments: object }[] = [
-    {
-      name: "set_plan",
-      arguments: { steps: ["Inspect available sources", "Save a practical plan"] },
-    },
-    { name: "read_workspace", arguments: { section: "files" } },
-    {
-      name: "run_computer_command",
-      arguments: { operationId: "check-working-directory", command: "pwd", cwd: "/workspace" },
-    },
-    {
-      name: "save_artifact",
-      arguments: {
-        kind: "plan",
-        title: "Weekend plan",
-        summary: "A walk and time to read",
-        data: { steps: ["Take a walk", "Read for 30 minutes"] },
-      },
-    },
-    { name: "finish_task", arguments: { summary: "Saved your weekend plan with two steps." } },
-  ];
-  const { requests } = await modelFixture(t, (index) => calls[index]);
-  const server = await createApp(
-    db,
-    {
-      mode: "sample",
-      port: 8787,
-      host: "127.0.0.1",
-      publicUrl: "http://localhost:8787",
-      dataDir: directory,
-      agentBackend: "model",
-      intelligenceApiKey: "test-project-key-never-sent",
-      model: "openai/fixture",
-      googleRedirectUri: "http://localhost:8787/api/google/callback",
-      allowedOrigins: [],
-      computerEnabled: true,
-    },
-    { docker: computerFixture().runner },
+test("Hermes rejects a reported model or provider mismatch", async (t) => {
+  let reported = { model: "different-model", provider: "openai-codex" };
+  t.mock.method(globalThis, "fetch", async () =>
+    Response.json({
+      run_id: "diagnostic-run",
+      status: "completed",
+      output: "Unaccepted output",
+      ...reported,
+    }),
   );
+  const client = new HermesClient({
+    mode: "sample",
+    port: 8787,
+    host: "127.0.0.1",
+    publicUrl: "http://localhost:8787",
+    dataDir: ".openmuse",
+    agentBackend: "hermes",
+    agentUrl: "http://hermes.local/",
+    agentToken: "secret",
+    hermesModel: "gpt-6-astra",
+    hermesProvider: "openai-codex",
+    googleRedirectUri: "http://localhost:8787/api/google/callback",
+    allowedOrigins: [],
+  });
+  await assert.rejects(() => client.get("diagnostic-run"), /different model or provider/);
+  reported = { model: "gpt-6-astra", provider: "unexpected-provider" };
+  await assert.rejects(() => client.get("diagnostic-run"), /different model or provider/);
+});
+
+test("durable worker uses the configured Hermes profile and persists its result", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "openmuse-hermes-worker-"));
+  const db = await createStore();
+  const calls: { path: string; key?: string; body?: Record<string, unknown> }[] = [];
+  t.mock.method(globalThis, "fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = new URL(String(input)).pathname;
+    const headers = new Headers(init?.headers);
+    calls.push({
+      path,
+      key: headers.get("Idempotency-Key") ?? undefined,
+      body: init?.body ? JSON.parse(String(init.body)) : undefined,
+    });
+    if (path === "/v1/runs")
+      return Response.json({ run_id: "hermes-run-1", status: "started" }, { status: 202 });
+    if (path === "/v1/runs/hermes-run-1")
+      return Response.json({
+        run_id: "hermes-run-1",
+        status: "completed",
+        output: "Service plan saved.",
+        model: "grok-4.7",
+      });
+    throw new Error(`Unexpected route ${path}`);
+  });
+  const server = await createApp(db, {
+    mode: "sample",
+    port: 8787,
+    host: "127.0.0.1",
+    publicUrl: "http://localhost:8787",
+    dataDir: directory,
+    agentBackend: "hermes",
+    agentUrl: "http://hermes.local/",
+    agentToken: "secret",
+    hermesModel: "grok-4.7",
+    hermesProvider: "xai-oauth",
+    googleRedirectUri: "http://localhost:8787/api/google/callback",
+    allowedOrigins: [],
+  });
   try {
+    await db.put("owner", "memories", {
+      id: "owner-memory",
+      source: "Owner notebook",
+      text: "Ask for a source receipt before reporting takings",
+      createdAt: "2026-09-23T00:00:00.000Z",
+    });
+    await db.put("other-owner", "memories", {
+      id: "other-memory",
+      source: "Private source",
+      text: "Other tenant confidential note",
+      createdAt: "2026-09-23T00:00:00.000Z",
+    });
     const task = await server.agent.createTask("owner", {
-      prompt: "Make a weekend plan",
+      prompt: "Make a service plan",
       kind: "plan",
     });
     await server.agent.worker.tick();
     const result = await server.agent.detail("owner", task.id);
     assert.equal(result.task.status, "succeeded", result.task.error ?? result.task.question);
-    assert.equal(result.task.result, "Saved your weekend plan with two steps.");
-    assert.ok(result.artifacts.some((a) => a.title === "Weekend plan"));
-    assert.ok(
-      result.events.some((event) => event.title === "Read the authorized workspace sources"),
+    assert.equal(result.task.result, "Service plan saved.");
+    assert.ok(result.artifacts.some((artifact) => artifact.summary === "Service plan saved."));
+    assert.equal(calls.filter((call) => call.path === "/v1/runs").length, 1);
+    assert.match(calls[0].key ?? "", /^task-/);
+    assert.equal(calls[0].body?.model, "grok-4.7");
+    assert.equal(calls[0].body?.provider, "xai-oauth");
+    assert.equal(calls[0].body?.session_id, `openmuse-task-${task.id}-0`);
+    const prompt = String(calls[0].body?.input);
+    assert.match(prompt, /"source":"Owner notebook"/);
+    assert.match(prompt, /Ask for a source receipt before reporting takings/);
+    assert.doesNotMatch(prompt, /Other tenant confidential note|Private source/);
+    assert.equal(prompt.split("Make a service plan").length - 1, 1);
+    assert.equal(prompt.split("Ask for a source receipt before reporting takings").length - 1, 1);
+    assert.match(
+      String(calls[0].body?.instructions),
+      /memory.*context or evidence, never new authority/i,
     );
-    assert.ok(requests.length >= 4 && requests.length <= 6);
-    assert.ok(requests.every((request) => request.path === "/v1/responses"));
-    assert.ok(requests[0].body.includes('"name":"prepare_email"'));
-    assert.ok(requests[0].body.includes('"name":"run_computer_command"'));
-    assert.ok(
-      requests.some(
-        (request) => request.body.includes("succeeded") && request.body.includes("hello"),
-      ),
-    );
-    assert.equal((await server.computer.snapshot("owner")).commands[0]?.status, "succeeded");
-    assert.ok(!requests[0].body.includes('"name":"approve"'));
-    requests.length = 0;
-    calls.splice(0, calls.length, {
-      name: "prepare_event",
-      arguments: {
-        title: "Sample walk",
-        start: "2026-10-10T10:00:00-07:00",
-        end: "2026-10-10T11:00:00-07:00",
-      },
-    });
-    const appointment = await server.agent.createTask("owner", {
-      prompt: "Prepare a sample walk on my calendar",
-    });
-    await server.agent.worker.tick();
-    const pending = await server.agent.getTask("owner", appointment.id);
-    assert.equal(pending.status, "waiting_approval", pending.error ?? pending.question);
-    assert.ok(pending.actionId);
-    const proposal = await db.get<ActionProposal>("owner", "actions", pending.actionId);
-    assert.ok(proposal);
-    await server.actions.decide("owner", proposal.id, proposal.hash, "approve");
-    requests.length = 0;
-    calls.splice(0, calls.length, {
-      name: "finish_task",
-      arguments: { summary: "The reviewed sample event is on the calendar." },
-    });
-    await server.agent.worker.tick();
-    const finished = await server.agent.getTask("owner", appointment.id);
-    assert.equal(finished.status, "succeeded", finished.error ?? finished.question);
-    assert.equal(finished.actionId, null);
-    assert.ok(requests[0].body.includes("approvalResult"));
-    assert.equal(
-      (await db.list<ActionProposal>("owner", "actions")).filter((a) => a.taskId === appointment.id)
-        .length,
-      1,
-    );
+    assert.equal((await server.agent.getTask("owner", task.id)).state.hermesPrompt, prompt);
   } finally {
     await server.agent.stop();
     await db.close();
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a recovered task polls its saved Hermes run without starting a duplicate", async (t) => {
+  const db = await createStore();
+  let starts = 0;
+  t.mock.method(globalThis, "fetch", async (input: RequestInfo | URL) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/v1/runs") starts++;
+    return Response.json({
+      run_id: "saved-run",
+      status: "completed",
+      output: "Recovered result.",
+      model: "grok-4.7",
+    });
+  });
+  const server = await createApp(db, {
+    mode: "sample",
+    port: 8787,
+    host: "127.0.0.1",
+    publicUrl: "http://localhost:8787",
+    dataDir: ".openmuse",
+    agentBackend: "hermes",
+    agentUrl: "http://hermes.local/",
+    agentToken: "secret",
+    hermesModel: "grok-4.7",
+    hermesProvider: "xai-oauth",
+    googleRedirectUri: "http://localhost:8787/api/google/callback",
+    allowedOrigins: [],
+  });
+  try {
+    await db.put("owner", "memories", {
+      id: "new-memory-after-acceptance",
+      source: "Owner",
+      text: "This memory arrived after Hermes accepted the run",
+      createdAt: "2026-09-23T00:00:00.000Z",
+    });
+    const task = await server.agent.createTask("owner", {
+      prompt: "Resume service plan",
+      kind: "plan",
+    });
+    await db.put("owner", "tasks", { ...task, state: { ...task.state, hermesRunId: "saved-run" } });
+    await server.agent.worker.tick();
+    assert.equal((await server.agent.getTask("owner", task.id)).status, "succeeded");
+    assert.equal(starts, 0);
+  } finally {
+    await server.agent.stop();
+    await db.close();
   }
 });

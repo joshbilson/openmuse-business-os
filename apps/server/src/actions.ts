@@ -33,6 +33,7 @@ export class ActionService {
   constructor(
     private readonly db: Store,
     private readonly options: Options,
+    private readonly approvalMode: "manual" | "standing-authority" = "manual",
   ) {
     this.now = options.now ?? Date.now;
   }
@@ -48,7 +49,10 @@ export class ActionService {
         : createHash("sha256").update(idempotencyKey).digest("hex");
     if (idempotencyKey !== undefined) {
       const existing = await this.db.get<ActionProposal>(owner, "actions", id);
-      if (existing) return existing;
+      if (existing)
+        return existing.status === "awaiting_review" && existing.authority === "standing-authority"
+          ? this.decide(owner, existing.id, existing.hash, "approve")
+          : existing;
     }
     const parsed = proposalSchema.parse(raw);
     const connection = await this.options.connection?.(owner);
@@ -74,6 +78,7 @@ export class ActionService {
       target: prepared?.target,
       targetVersion: prepared?.targetVersion,
       status: "awaiting_review",
+      authority: this.approvalMode,
       hash: createHash("sha256")
         .update(
           JSON.stringify({
@@ -97,7 +102,9 @@ export class ActionService {
       return existing;
     }
     await this.record(owner, saved, "Ready for your review");
-    return saved;
+    return this.approvalMode === "standing-authority"
+      ? this.decide(owner, saved.id, saved.hash, "approve")
+      : saved;
   }
   async decide(
     owner: string,

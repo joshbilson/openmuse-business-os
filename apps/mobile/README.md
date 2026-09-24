@@ -20,7 +20,7 @@ pnpm --dir apps/mobile ios
 pnpm --dir apps/mobile android
 ```
 
-The default API is `http://localhost:8787`, or `http://10.0.2.2:8787` on the Android emulator. Set `EXPO_PUBLIC_API_URL` to your reachable server URL for a physical device or deployment. Live mode asks for the server access key; local mode opens the fictional workspace automatically. Tokens stay in memory.
+The local API defaults to `http://localhost:8787`, or `http://10.0.2.2:8787` on the Android emulator. Deployed HTTPS web uses its own origin for the API. Set `EXPO_PUBLIC_API_URL` to the private server URL when building a native app. Live mode asks for the server access key; local mode opens the fictional workspace automatically. Session tokens stay in memory; native devices save the access key in secure OS storage so a cold-start incoming call can authenticate.
 
 PDFs use `react-native-pdf` and `react-native-blob-util` in an Expo **development build**. Expo Go does not include these native modules. The config plugins in `app.json` configure the native projects. Web uses the browser’s real PDF reader, with page/zoom controls and download/print access. PDF form fields save a new server artifact.
 
@@ -28,13 +28,15 @@ PDFs use `react-native-pdf` and `react-native-blob-util` in an Expo **developmen
 
 ```sh
 pnpm --dir apps/mobile typecheck
-node --experimental-strip-types --test apps/mobile/test/date-time.test.ts
+pnpm exec tsx --test apps/mobile/test/*.test.ts
 pnpm --dir apps/mobile build:web
 pnpm --dir apps/mobile build:ios
 pnpm --dir apps/mobile build:android
 ```
 
 The `build:ios` and `build:android` commands validate and export platform JavaScript/Hermes bundles. They do not create signed installable apps. `ios` and `android` run Expo’s native development-build workflows and need the platform toolchains.
+
+[iPhone calling build and acceptance](docs/IOS-CALLING.md) covers the custom CallKit/PushKit build and physical-device checks. A brief network interruption may recover on the same call; an ended provider session or prolonged loss offers a new call in the same conversation.
 
 ## Behavior
 

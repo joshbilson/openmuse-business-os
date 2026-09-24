@@ -28,6 +28,7 @@ import { ConversationQueue, type QueuedMessage } from "./conversation-queue";
 import { runConversationTurn } from "./conversation-run";
 import { MailToolCard } from "./mail-tool-card";
 import { FileThreadCard, TaskThreadCard } from "./thread-artifacts";
+import { restoreSavedMessages } from "./thread-hydration";
 import { type Selection, useMuseThread } from "./threads";
 import { Button, Card, CheckRow, colors, ErrorNotice, s } from "./ui";
 import { useWorkspace } from "./workspace";
@@ -212,12 +213,26 @@ export function ChatScreen({
     async function hydrate() {
       try {
         if (richThreads) {
-          if (selection.existing)
-            await runConversationTurn(
-              agentId,
-              () => copilotkit.connectAgent({ agent }),
-              (onError) => copilotkit.subscribe({ onError }),
+          if (selection.existing) {
+            // A first CopilotKit connection clears the agent's local messages.
+            // Restore Oracle's authoritative history after that reset.
+            await restoreSavedMessages(
+              () =>
+                runConversationTurn(
+                  agentId,
+                  () => copilotkit.connectAgent({ agent }),
+                  (onError) => copilotkit.subscribe({ onError }),
+                ),
+              async () =>
+                (
+                  await api.request<{ messages: Message[] }>(
+                    `/api/copilotkit/threads/${encodeURIComponent(threadId)}/messages`,
+                  )
+                ).messages,
+              (messages) => agent.setMessages(messages),
+              () => active,
             );
+          }
         } else {
           const { messages } = await api.request<{ messages: Message[] }>("/api/conversation");
           if (active) agent.setMessages(messages);
@@ -238,7 +253,17 @@ export function ChatScreen({
       replay.unsubscribe();
       if (richThreads) void agent.detachActiveRun().catch(() => {});
     };
-  }, [agent, agentId, api, copilotkit, isReady, historyAttempt, richThreads, selection.existing]);
+  }, [
+    agent,
+    agentId,
+    api,
+    copilotkit,
+    isReady,
+    historyAttempt,
+    richThreads,
+    selection.existing,
+    threadId,
+  ]);
   const saveHistory = useCallback(async () => {
     if (!richThreads) await api.request("/api/conversation", { messages: agent.messages }, "PUT");
     setSaveError("");

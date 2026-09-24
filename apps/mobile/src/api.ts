@@ -1,14 +1,28 @@
 import { Platform } from "react-native";
 
+// The deployed web app and API share a private HTTPS origin. Resolve it at
+// runtime so a cached or separately built bundle never points at localhost.
+const webOrigin =
+  Platform.OS === "web" && typeof window !== "undefined" && window.location.protocol === "https:"
+    ? window.location.origin
+    : undefined;
+
 export const API_URL = (
+  webOrigin ||
   process.env.EXPO_PUBLIC_API_URL ||
   (Platform.OS === "android" ? "http://10.0.2.2:8787" : "http://localhost:8787")
 ).replace(/\/$/, "");
 
 export class MuseApi {
   constructor(readonly token: string) {}
-  async request<T>(path: string, body?: unknown, method?: string): Promise<T> {
+  async request<T>(
+    path: string,
+    body?: unknown,
+    method?: string,
+    signal?: AbortSignal,
+  ): Promise<T> {
     const response = await fetch(`${API_URL}${path}`, {
+      signal,
       method: method ?? (body === undefined ? "GET" : "POST"),
       headers: {
         Authorization: `Bearer ${this.token}`,

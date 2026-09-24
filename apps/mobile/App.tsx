@@ -16,6 +16,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   AppState,
+  Linking,
   Pressable,
   ScrollView,
   Text,
@@ -38,8 +39,10 @@ import { ComputerEntry } from "./src/computer";
 import { ComputerDraftProvider } from "./src/computer-drafts";
 import { Details } from "./src/details";
 import { BrowserScreen, CalendarScreen, FilesScreen, MailScreen } from "./src/screens";
+import { getSavedAccessKey, saveAccessKey } from "./src/session-secret";
 import { ThreadsProvider, ThreadsSheet, useMuseThread } from "./src/threads";
 import { Button, Card, colors, ErrorNotice, Field, IconButton, Mascot, s } from "./src/ui";
+import { VoiceCallWidget } from "./src/voice-call";
 import { type Detail, useWorkspace, WorkspaceContext } from "./src/workspace";
 
 const nav: { id: Section; label: string; icon: LucideIcon }[] = [
@@ -66,8 +69,17 @@ const titles: Partial<Record<Section, { title: string; subtitle: string }>> = {
   browser: { title: "Browser", subtitle: "Your connected browsing sessions." },
   files: { title: "Files", subtitle: "Documents, forms and filled copies." },
 };
+type LegalStatus = {
+  required: boolean;
+  accepted: boolean;
+  acceptedAt: string | null;
+  terms: string;
+  privacy: string;
+};
 export default function App() {
   const [token, setToken] = useState("");
+  const [legal, setLegal] = useState<LegalStatus>();
+  const [agreed, setAgreed] = useState(false);
   const [accessKey, setAccessKey] = useState("");
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState("");
@@ -75,7 +87,10 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
-      const session = await createSession(key);
+      const session = await createSession(key || (await getSavedAccessKey()) || undefined);
+      const status = await new MuseApi(session.token).request<LegalStatus>("/api/legal/status");
+      if (key) await saveAccessKey(key);
+      setLegal(status);
       setToken(session.token);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -86,16 +101,84 @@ export default function App() {
   useEffect(() => {
     void connect();
   }, [connect]);
+  const acceptLegal = async () => {
+    if (!token || !legal || !agreed) return;
+    setBusy(true);
+    setError("");
+    try {
+      const api = new MuseApi(token);
+      await api.request("/api/legal/accept", {
+        agree: true,
+        termsVersion: legal.terms,
+        privacyVersion: legal.privacy,
+      });
+      setLegal(await api.request<LegalStatus>("/api/legal/status"));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
   return (
     <SafeAreaProvider>
       <StatusBar style="dark" />
-      {token ? (
+      {token && legal?.accepted ? (
         <CopilotKitProvider
           runtimeUrl={`${API_URL}/api/copilotkit`}
           headers={{ Authorization: `Bearer ${token}` }}
         >
           <WorkspaceApp token={token} />
         </CopilotKitProvider>
+      ) : token && legal ? (
+        <SafeAreaView
+          style={{ flex: 1, backgroundColor: colors.canvas, justifyContent: "center", padding: 24 }}
+        >
+          <Card style={{ width: "100%", maxWidth: 480, alignSelf: "center", gap: 18 }}>
+            <Text style={s.title}>Before opening your workspace</Text>
+            <Text style={s.muted}>
+              Read the current Terms of use and Privacy notice. The workspace records when you
+              accept these versions.
+            </Text>
+            <View style={{ flexDirection: "row", gap: 20 }}>
+              <Text
+                accessibilityRole="link"
+                onPress={() => void Linking.openURL(`${API_URL}/terms`)}
+                style={{ color: colors.blueDark }}
+              >
+                Terms of use
+              </Text>
+              <Text
+                accessibilityRole="link"
+                onPress={() => void Linking.openURL(`${API_URL}/privacy`)}
+                style={{ color: colors.blueDark }}
+              >
+                Privacy notice
+              </Text>
+            </View>
+            <Pressable
+              accessibilityRole="checkbox"
+              accessibilityState={{ checked: agreed }}
+              onPress={() => setAgreed((current) => !current)}
+              style={{ flexDirection: "row", alignItems: "center", gap: 10 }}
+            >
+              <Text style={s.text}>{agreed ? "☑" : "☐"}</Text>
+              <Text style={[s.text, { flex: 1 }]}>I have read and agree to both documents.</Text>
+            </Pressable>
+            <ErrorNotice error={error} />
+            <Button primary disabled={!agreed} busy={busy} onPress={() => void acceptLegal()}>
+              Agree and open workspace
+            </Button>
+            <Button
+              onPress={() => {
+                setToken("");
+                setLegal(undefined);
+                setAgreed(false);
+              }}
+            >
+              Back to sign-in
+            </Button>
+          </Card>
+        </SafeAreaView>
       ) : (
         <SafeAreaView
           style={{
@@ -133,6 +216,22 @@ export default function App() {
                   Local workspaces open without a key. Make sure your OpenMuse server is running at{" "}
                   {API_URL}.
                 </Text>
+                <View style={{ flexDirection: "row", gap: 20, marginTop: 12 }}>
+                  <Text
+                    accessibilityRole="link"
+                    onPress={() => void Linking.openURL(`${API_URL}/privacy`)}
+                    style={{ color: colors.blueDark }}
+                  >
+                    Privacy notice
+                  </Text>
+                  <Text
+                    accessibilityRole="link"
+                    onPress={() => void Linking.openURL(`${API_URL}/terms`)}
+                    style={{ color: colors.blueDark }}
+                  >
+                    Terms of use
+                  </Text>
+                </View>
               </Card>
             )}
           </View>
@@ -240,10 +339,11 @@ function WorkspaceShell({
   error: string;
   prompt?: { id: number; text: string };
 }) {
-  const { workspace, section, navigate, open } = useWorkspace();
+  const { workspace, section, navigate, open, api, notify } = useWorkspace();
   const { data } = useAgentWorkspace();
   const {
     selection,
+    select,
     visited,
     mainId,
     loading: threadsLoading,
@@ -338,6 +438,21 @@ function WorkspaceShell({
                 </Text>
               </Pressable>
               {section === "chat" && <ComputerEntry />}
+            </View>
+            <View style={{ position: "absolute", right: 46, top: 16 }}>
+              <VoiceCallWidget
+                api={api}
+                agentName={agentName}
+                threadId={selection.id}
+                notify={notify}
+                onNotificationOpen={(data) => {
+                  if (typeof data.threadId === "string")
+                    select({ id: data.threadId, existing: true });
+                  else if (typeof data.taskId === "string")
+                    open({ type: "task", taskId: data.taskId });
+                  else navigate("activity");
+                }}
+              />
             </View>
             <View style={{ position: "absolute", right: 0, top: 16 }}>
               <IconButton

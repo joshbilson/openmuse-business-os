@@ -1,4 +1,3 @@
-import { useThreads } from "@copilotkit/react-native/headless";
 import {
   Archive,
   CalendarDays,
@@ -11,6 +10,7 @@ import {
 } from "lucide-react-native";
 import { createContext, type ReactNode, useContext, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
+import { useLocalThreads } from "./local-threads";
 import { Button, colors, ErrorNotice, Field, LinkRow, Sheet, s } from "./ui";
 import { useWorkspace } from "./workspace";
 
@@ -55,8 +55,10 @@ export function ThreadsProvider({ children }: { children: ReactNode }) {
         if (!active) return;
         const next = { id: main.threadId, existing: main.existing };
         setMainId(next.id);
-        setSelection(next);
-        setVisited([next]);
+        setSelection((current) => (current.id === "local" ? next : current));
+        setVisited((current) =>
+          current.some((item) => item.id === next.id) ? current : [next, ...current],
+        );
         setLoading(false);
       })
       .catch((e) => {
@@ -111,8 +113,8 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
     select,
     start,
   } = useMuseThread();
-  const { workspace, open, navigate, refresh } = useWorkspace();
-  const threads = useThreads({ agentId: "default", enabled, includeArchived: true, limit: 20 });
+  const { workspace, open, navigate, refresh, api } = useWorkspace();
+  const threads = useLocalThreads(api, enabled);
   const [editing, setEditing] = useState<string>();
   const [name, setName] = useState("");
   const [error, setError] = useState("");
@@ -271,12 +273,6 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
                     : "Keep a separate topic here. Your main chat is always available."}
                 </Text>
               )}
-            <ErrorNotice error={threads.fetchMoreError?.message} />
-            {threads.hasMoreThreads && (
-              <Button small busy={threads.isFetchingMoreThreads} onPress={threads.fetchMoreThreads}>
-                Load more conversations
-              </Button>
-            )}
             <Text style={s.small}>
               Side chats keep their own conversation context. Your agent’s saved memory is shared.
             </Text>

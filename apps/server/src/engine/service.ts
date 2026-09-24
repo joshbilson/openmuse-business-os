@@ -30,6 +30,7 @@ import type { Config } from "../config.ts";
 import type { Store } from "../db.ts";
 import { AppError } from "../errors.ts";
 import type { Files } from "../files.ts";
+import { HermesClient } from "../hermes.ts";
 import { backgroundFailure } from "../log.ts";
 import type { WorkspaceService } from "../workspace.ts";
 import { analyzeSpending } from "./finance.ts";
@@ -253,6 +254,12 @@ export class AgentService {
           409,
         );
     }
+    if (
+      (action === "pause" || action === "cancel") &&
+      task.status === "running" &&
+      typeof task.state.hermesRunId === "string"
+    )
+      await new HermesClient(this.config).stop(task.state.hermesRunId);
     const updated = await this.db.compareAndSwap<AgentTask>(
       owner,
       "tasks",
@@ -263,10 +270,21 @@ export class AgentService {
         leaseId: null,
         leaseUntil: null,
         error: null,
+        ...(action === "retry"
+          ? {
+              state: {
+                ...task.state,
+                hermesRunId: null,
+                hermesPrompt: null,
+                hermesPromptGeneration: null,
+                hermesGeneration: Number(task.state.hermesGeneration ?? 0) + 1,
+              },
+            }
+          : {}),
         updatedAt: date(),
         result:
           action === "cancel"
-            ? "Stopped by you."
+            ? "Stop requested. Check the task outcome before repeating external actions."
             : action === "pause"
               ? "Paused. Resume when you're ready."
               : "",
@@ -633,9 +651,11 @@ export class AgentService {
       throw error;
     }
     await context.event(
-      "approval",
+      proposal.authority === "standing-authority" ? "step" : "approval",
       proposal.title,
-      `Review prepared for ${proposal.account ?? "the connected account"}`,
+      proposal.authority === "standing-authority"
+        ? `Standing authorization used for ${proposal.account ?? "the connected account"}; ${proposal.status}`
+        : `Review prepared for ${proposal.account ?? "the connected account"}`,
     );
     return proposal;
   }

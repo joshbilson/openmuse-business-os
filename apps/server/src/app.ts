@@ -1,50 +1,105 @@
 import { randomUUID } from "node:crypto";
 import { MessageSchema } from "@ag-ui/core";
-import { CopilotKitIntelligence } from "@copilotkit/runtime/v2";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
+import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { cors } from "hono/cors";
 import { z } from "zod";
 import { emailDraftSchema, proposalSchema } from "../../../packages/domain/src/index.ts";
 import { ActionService } from "./actions.ts";
 import { agentConfigured, makeRuntime } from "./agent.ts";
+import type { AuditInput, AuditWriter } from "./audit.ts";
 import { createAuth } from "./auth.ts";
 import { BrowserService } from "./browser.ts";
+import { businessCallbackRoutes, businessRoutes } from "./business/routes.ts";
+import { BusinessService } from "./business/service.ts";
+import { BusinessViews } from "./business/views.ts";
 import { ComputerService, type DockerRunner } from "./computer.ts";
 import { computerRoutes } from "./computer-routes.ts";
 import { assertApiDeploymentConfig, type Config } from "./config.ts";
+import { ConversationStore } from "./conversations.ts";
 import type { Store } from "./db.ts";
+import { engagementRoutes } from "./engagement/routes.ts";
+import { EngagementService } from "./engagement/service.ts";
 import { agentRoutes } from "./engine/routes.ts";
 import { AgentService } from "./engine/service.ts";
 import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
 import { GoogleAuth } from "./google-auth.ts";
+import { HermesClient } from "./hermes.ts";
+import {
+  type LegalAcceptance,
+  legalAcceptanceId,
+  legalVersions,
+  privacyHtml,
+  termsHtml,
+} from "./legal.ts";
+import { operatorRoutes } from "./operator/routes.ts";
 import { WorkspaceService } from "./workspace.ts";
 
 export async function createApp(
   db: Store,
   config: Config,
-  options: { docker?: DockerRunner } = {},
+  options: { docker?: DockerRunner; audit?: Pick<AuditWriter, "append"> } = {},
 ) {
   assertApiDeploymentConfig(config);
   const auth = await createAuth(db, config),
     files = new Files(db, config, auth),
     google = new GoogleAuth(db, config),
     workspace = new WorkspaceService(db, config, files, google);
-  const actions = new ActionService(db, {
-    execute: (owner, input, connectionId, targetVersion) =>
-      workspace.execute(owner, input, connectionId, targetVersion),
-    prepare: (owner, input, connectionId) => workspace.prepare(owner, input, connectionId),
-    connected: (owner) => workspace.connected(owner),
-    connection: (owner) => workspace.connection(owner),
-  });
+  const actions = new ActionService(
+    db,
+    {
+      execute: (owner, input, connectionId, targetVersion) =>
+        workspace.execute(owner, input, connectionId, targetVersion),
+      prepare: (owner, input, connectionId) => workspace.prepare(owner, input, connectionId),
+      connected: (owner) => workspace.connected(owner),
+      connection: (owner) => workspace.connection(owner),
+    },
+    config.actionApprovalMode ?? "manual",
+  );
   const browser = new BrowserService(db, config, auth, files);
   const computer = new ComputerService(db, config, options.docker);
   const agent = new AgentService(db, config, workspace, files, actions, browser, computer);
-  const intelligence = new CopilotKitIntelligence({ apiKey: config.intelligenceApiKey });
-  const runtime = makeRuntime(config, agent, auth, intelligence);
+  const hermes = new HermesClient(config);
+  const conversations = new ConversationStore(db, hermes);
+  const business = new BusinessService(db, config);
+  const engagement = new EngagementService(db, agent, {
+    appendMessages: (owner, threadId, messages) =>
+      conversations.appendMessages(owner, threadId, messages),
+    readMessages: async (owner, threadId) => {
+      await conversations.ensureThread(owner, threadId);
+      return conversations.messages(owner, threadId);
+    },
+  });
+  const runtime = makeRuntime(config, conversations, auth, agent);
   const app = new Hono<{ Variables: { owner: string } }>();
-  const origins = new Set([...config.allowedOrigins, new URL(config.publicUrl).origin]);
+  const audit = async (event: AuditInput) => {
+    if (!options.audit) return;
+    try {
+      await options.audit.append(event);
+    } catch {
+      throw new AppError("Audit logging is unavailable", 503);
+    }
+  };
+  const accessAction = (path: string, method: string) => {
+    const area = ["business", "operator", "voice", "files", "agent", "computer"].find(
+      (part) => path === `/api/${part}` || path.startsWith(`/api/${part}/`),
+    );
+    return `access.${area ?? "workspace"}.${method === "GET" || method === "HEAD" ? "read" : "write"}`;
+  };
+  const publicOrigin = new URL(config.publicUrl).origin;
+  const origins = new Set([...config.allowedOrigins, publicOrigin]);
+  // Cookie auth is reserved for the web app served at the API's public origin.
+  const sameOriginBrowser = (headers: Headers) => {
+    const origin = headers.get("origin");
+    const fetchSite = headers.get("sec-fetch-site");
+    return (
+      (!origin || origin === publicOrigin) &&
+      (!fetchSite || fetchSite === "same-origin") &&
+      (origin === publicOrigin || fetchSite === "same-origin")
+    );
+  };
   app.use("*", async (c, next) => {
     const origin = c.req.header("origin");
     if (origin && !origins.has(origin)) return c.json({ error: "Origin is not allowed" }, 403);
@@ -96,20 +151,73 @@ export async function createApp(
       browserConfigured: Boolean(config.workerUrl && config.workerToken),
     }),
   );
+  // Public documents contain no workspace data and must be readable before sign-in.
+  app.get("/privacy", (c) => c.html(privacyHtml));
+  app.get("/terms", (c) => c.html(termsHtml));
   let loginWindow = 0,
     loginAttempts = 0;
   app.post("/api/session", async (c) => {
-    if (Date.now() - loginWindow > 60000) {
-      loginWindow = Date.now();
-      loginAttempts = 0;
+    const requestId = randomUUID();
+    await audit({
+      principalKind: "process",
+      principalId: "unauthenticated",
+      action: "auth.attempt",
+      source: "openmuse.api",
+      outcome: "unknown",
+      requestId,
+    });
+    let session: { token: string; mode: Config["mode"] };
+    let browser: boolean;
+    let cookie: string | undefined;
+    let accessKey: string | undefined;
+    try {
+      const body = z.object({ accessKey: z.string().optional() }).parse(await c.req.json());
+      accessKey = body.accessKey;
+      browser = sameOriginBrowser(c.req.raw.headers);
+      cookie = browser ? getCookie(c, "openmuse_session", "host") : undefined;
+      if (!accessKey && cookie) {
+        // Reusing a cookie never extends its server-side expiry.
+        await auth.ownerToken(cookie);
+        session = { token: cookie, mode: config.mode };
+      } else {
+        if (Date.now() - loginWindow > 60000) {
+          loginWindow = Date.now();
+          loginAttempts = 0;
+        }
+        if (++loginAttempts > 30)
+          throw new AppError("Too many sign-in attempts. Try again in a minute.", 429);
+        session = await auth.session(accessKey);
+      }
+      await workspace.ensureSample("local-user", actions);
+      await agent.ensure("local-user");
+      if (config.mode === "sample") await agent.refreshIdeas("local-user");
+    } catch (error) {
+      const denied = error instanceof AppError && [401, 403, 429].includes(error.status);
+      await audit({
+        principalKind: "process",
+        principalId: "unauthenticated",
+        action: denied ? "auth.denied" : "auth.failure",
+        source: "openmuse.api",
+        outcome: denied ? "denied" : "failure",
+        requestId,
+      });
+      throw error;
     }
-    if (++loginAttempts > 30)
-      throw new AppError("Too many sign-in attempts. Try again in a minute.", 429);
-    const body = z.object({ accessKey: z.string().optional() }).parse(await c.req.json());
-    const session = await auth.session(body.accessKey);
-    await workspace.ensureSample("local-user", actions);
-    await agent.ensure("local-user");
-    if (config.mode === "sample") await agent.refreshIdeas("local-user");
+    await audit({
+      principalKind: "owner",
+      principalId: "local-user",
+      action: "auth.session",
+      source: "openmuse.api",
+      outcome: "success",
+      requestId,
+    });
+    if (browser && (!cookie || accessKey))
+      setCookie(c, "openmuse_session", session.token, {
+        prefix: "host",
+        httpOnly: true,
+        sameSite: "Strict",
+        maxAge: auth.sessionCookieMaxAge(),
+      });
     return c.json(session);
   });
   app.get("/api/google/callback", async (c) => {
@@ -123,17 +231,122 @@ export async function createApp(
       "<h1>Google is connected</h1><p>Return to OpenMuse and refresh your workspace.</p>",
     );
   });
+  app.route("/api/business", businessCallbackRoutes(business));
   app.use("/api/*", async (c, next) => {
+    const requestId = randomUUID();
     const signedRoute =
       /^\/api\/files\/[^/]+\/content$|^\/api\/browsers\/[^/]+\/(?:preview|console)$/.test(
         c.req.path,
       );
-    const owner =
-      signedRoute && c.req.query("signature")
-        ? auth.verify(new URL(c.req.url))
-        : await auth.owner(c.req.header("authorization"));
+    const authorization = c.req.header("authorization");
+    const cookie = sameOriginBrowser(c.req.raw.headers)
+      ? getCookie(c, "openmuse_session", "host")
+      : undefined;
+    let owner: string;
+    try {
+      owner =
+        signedRoute && c.req.query("signature")
+          ? auth.verify(new URL(c.req.url))
+          : authorization
+            ? await auth.owner(authorization)
+            : cookie
+              ? await auth.ownerToken(cookie)
+              : await auth.owner();
+    } catch (error) {
+      const denied = error instanceof AppError && [401, 403].includes(error.status);
+      await audit({
+        principalKind: "process",
+        principalId: "unauthenticated",
+        action: denied ? "auth.denied" : "auth.failure",
+        source: "openmuse.api",
+        outcome: denied ? "denied" : "failure",
+        requestId,
+      });
+      throw error;
+    }
+    const action = accessAction(c.req.path, c.req.method);
+    await audit({
+      principalKind: "owner",
+      principalId: owner,
+      action: `${action}.attempt`,
+      source: "openmuse.api",
+      outcome: "unknown",
+      requestId,
+    });
     c.set("owner", owner);
+    let failure: unknown;
+    try {
+      await next();
+    } catch (error) {
+      failure = error;
+    }
+    await audit({
+      principalKind: "owner",
+      principalId: owner,
+      action,
+      source: "openmuse.api",
+      outcome: failure || c.res.status >= 400 ? "failure" : "success",
+      requestId,
+    });
+    if (failure) throw failure;
+  });
+  const acceptance = (owner: string) =>
+    db.get<LegalAcceptance>(owner, "legal-acceptances", legalAcceptanceId);
+  app.get("/api/legal/status", async (c) => {
+    const record = config.mode === "live" ? await acceptance(c.get("owner")) : null;
+    return c.json({
+      required: config.mode === "live",
+      accepted: config.mode !== "live" || Boolean(record),
+      acceptedAt: record?.acceptedAt ?? null,
+      ...legalVersions,
+    });
+  });
+  app.post("/api/legal/accept", async (c) => {
+    const input = z
+      .strictObject({
+        agree: z.literal(true),
+        termsVersion: z.string().length(64),
+        privacyVersion: z.string().length(64),
+      })
+      .parse(await c.req.json());
+    if (
+      input.termsVersion !== legalVersions.terms ||
+      input.privacyVersion !== legalVersions.privacy
+    )
+      throw new AppError("Terms or privacy notice changed. Read the current documents.", 409);
+    const owner = c.get("owner");
+    const record: LegalAcceptance = {
+      id: legalAcceptanceId,
+      owner,
+      acceptedAt: new Date().toISOString(),
+      termsVersion: legalVersions.terms,
+      privacyVersion: legalVersions.privacy,
+      method: "authenticated_acceptance_request",
+    };
+    // Application-level insert-once record; PostgreSQL administrators can still alter records.
+    const saved =
+      (await db.insertIfAbsent(owner, "legal-acceptances", record)) ?? (await acceptance(owner));
+    return c.json({ accepted: true, acceptedAt: saved?.acceptedAt, ...legalVersions });
+  });
+  app.use("/api/*", async (c, next) => {
+    if (
+      config.mode === "live" &&
+      !["/api/legal/status", "/api/legal/accept", "/api/logout"].includes(c.req.path) &&
+      !(await acceptance(c.get("owner")))
+    )
+      throw new AppError("Accept the current terms and privacy notice before using OpenMuse.", 403);
     await next();
+  });
+  app.post("/api/logout", async (c) => {
+    const cookie = sameOriginBrowser(c.req.raw.headers)
+      ? getCookie(c, "openmuse_session", "host")
+      : undefined;
+    const authorization = c.req.header("authorization");
+    if (cookie) await auth.revokeToken(cookie);
+    if (authorization?.startsWith("Bearer ")) await auth.revokeToken(authorization.slice(7));
+    if (sameOriginBrowser(c.req.raw.headers))
+      deleteCookie(c, "openmuse_session", { prefix: "host", httpOnly: true, sameSite: "Strict" });
+    return c.json({ ok: true });
   });
   app.get("/api/workspace", async (c) => {
     const snapshot = await workspace.snapshot(c.get("owner"), c.req.query("q"));
@@ -142,6 +355,9 @@ export async function createApp(
   });
   app.route("/api/agent", agentRoutes(agent));
   app.route("/api/computer", computerRoutes(computer, files));
+  app.route("/api", engagementRoutes(engagement));
+  app.route("/api/business", businessRoutes(business, new BusinessViews(db, business)));
+  app.route("/api/operator", operatorRoutes(db, agent, actions, engagement));
   app.get("/api/calendars", async (c) => c.json(await workspace.calendars(c.get("owner"))));
   app.get("/api/calendar/events", async (c) => {
     const query = z
@@ -202,18 +418,7 @@ export async function createApp(
     });
     const main = await db.get<{ threadId: string }>(owner, "conversation-settings", "main");
     if (!main) throw new AppError("Main conversation could not be loaded", 503);
-    try {
-      await intelligence.getOrCreateThread({
-        threadId: main.threadId,
-        userId: owner,
-        agentId: "default",
-      });
-    } catch {
-      throw new AppError(
-        "Main conversation is unavailable. Check the Rich Threads connection and try again.",
-        502,
-      );
-    }
+    await conversations.ensureThread(owner, main.threadId);
     return c.json({ threadId: main.threadId, existing: true });
   });
   app.get("/api/conversation", async (c) =>
@@ -318,11 +523,6 @@ export async function createApp(
     return c.json({ ok: true });
   });
   app.all("/api/copilotkit/*", async (c) => {
-    if (!agentConfigured(config))
-      throw new AppError(
-        "Configure a model and provider API key, or a valid AG-UI endpoint, to start chat",
-        503,
-      );
     const response = await runtime.fetch(c.req.raw);
     // Runtime 1.70 emits SSE strings; a WHATWG Response body requires byte chunks.
     const encoder = new TextEncoder();
@@ -335,8 +535,17 @@ export async function createApp(
     );
     return new Response(body, { status: response.status, headers: response.headers });
   });
-  app.get("/", (c) =>
-    c.json({ name: "OpenMuse", app: "http://localhost:8081", health: "/api/health" }),
-  );
-  return { app, auth, files, actions, workspace, agent, computer };
+  return {
+    app,
+    auth,
+    files,
+    actions,
+    workspace,
+    agent,
+    computer,
+    conversations,
+    hermes,
+    engagement,
+    business,
+  };
 }
