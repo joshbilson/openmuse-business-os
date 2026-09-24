@@ -8,6 +8,7 @@ import { z } from "zod";
 import { emailDraftSchema, proposalSchema } from "../../../packages/domain/src/index.ts";
 import { ActionService } from "./actions.ts";
 import { agentConfigured, makeRuntime } from "./agent.ts";
+import type { AuditInput, AuditWriter } from "./audit.ts";
 import { createAuth } from "./auth.ts";
 import { BrowserService } from "./browser.ts";
 import { businessCallbackRoutes, businessRoutes } from "./business/routes.ts";
@@ -39,7 +40,7 @@ import { WorkspaceService } from "./workspace.ts";
 export async function createApp(
   db: Store,
   config: Config,
-  options: { docker?: DockerRunner } = {},
+  options: { docker?: DockerRunner; audit?: Pick<AuditWriter, "append"> } = {},
 ) {
   assertApiDeploymentConfig(config);
   const auth = await createAuth(db, config),
@@ -73,6 +74,20 @@ export async function createApp(
   });
   const runtime = makeRuntime(config, conversations, auth, agent);
   const app = new Hono<{ Variables: { owner: string } }>();
+  const audit = async (event: AuditInput) => {
+    if (!options.audit) return;
+    try {
+      await options.audit.append(event);
+    } catch {
+      throw new AppError("Audit logging is unavailable", 503);
+    }
+  };
+  const accessAction = (path: string, method: string) => {
+    const area = ["business", "operator", "voice", "files", "agent", "computer"].find(
+      (part) => path === `/api/${part}` || path.startsWith(`/api/${part}/`),
+    );
+    return `access.${area ?? "workspace"}.${method === "GET" || method === "HEAD" ? "read" : "write"}`;
+  };
   const publicOrigin = new URL(config.publicUrl).origin;
   const origins = new Set([...config.allowedOrigins, publicOrigin]);
   // Cookie auth is reserved for the web app served at the API's public origin.
@@ -142,27 +157,61 @@ export async function createApp(
   let loginWindow = 0,
     loginAttempts = 0;
   app.post("/api/session", async (c) => {
-    const body = z.object({ accessKey: z.string().optional() }).parse(await c.req.json());
-    const browser = sameOriginBrowser(c.req.raw.headers);
-    const cookie = browser ? getCookie(c, "openmuse_session", "host") : undefined;
+    const requestId = randomUUID();
+    await audit({
+      principalKind: "process",
+      principalId: "unauthenticated",
+      action: "auth.attempt",
+      source: "openmuse.api",
+      outcome: "unknown",
+      requestId,
+    });
     let session: { token: string; mode: Config["mode"] };
-    if (!body.accessKey && cookie) {
-      // Reusing a cookie never extends its server-side expiry.
-      await auth.ownerToken(cookie);
-      session = { token: cookie, mode: config.mode };
-    } else {
-      if (Date.now() - loginWindow > 60000) {
-        loginWindow = Date.now();
-        loginAttempts = 0;
+    let browser: boolean;
+    let cookie: string | undefined;
+    let accessKey: string | undefined;
+    try {
+      const body = z.object({ accessKey: z.string().optional() }).parse(await c.req.json());
+      accessKey = body.accessKey;
+      browser = sameOriginBrowser(c.req.raw.headers);
+      cookie = browser ? getCookie(c, "openmuse_session", "host") : undefined;
+      if (!accessKey && cookie) {
+        // Reusing a cookie never extends its server-side expiry.
+        await auth.ownerToken(cookie);
+        session = { token: cookie, mode: config.mode };
+      } else {
+        if (Date.now() - loginWindow > 60000) {
+          loginWindow = Date.now();
+          loginAttempts = 0;
+        }
+        if (++loginAttempts > 30)
+          throw new AppError("Too many sign-in attempts. Try again in a minute.", 429);
+        session = await auth.session(accessKey);
       }
-      if (++loginAttempts > 30)
-        throw new AppError("Too many sign-in attempts. Try again in a minute.", 429);
-      session = await auth.session(body.accessKey);
+      await workspace.ensureSample("local-user", actions);
+      await agent.ensure("local-user");
+      if (config.mode === "sample") await agent.refreshIdeas("local-user");
+    } catch (error) {
+      const denied = error instanceof AppError && [401, 403, 429].includes(error.status);
+      await audit({
+        principalKind: "process",
+        principalId: "unauthenticated",
+        action: denied ? "auth.denied" : "auth.failure",
+        source: "openmuse.api",
+        outcome: denied ? "denied" : "failure",
+        requestId,
+      });
+      throw error;
     }
-    await workspace.ensureSample("local-user", actions);
-    await agent.ensure("local-user");
-    if (config.mode === "sample") await agent.refreshIdeas("local-user");
-    if (browser && (!cookie || body.accessKey))
+    await audit({
+      principalKind: "owner",
+      principalId: "local-user",
+      action: "auth.session",
+      source: "openmuse.api",
+      outcome: "success",
+      requestId,
+    });
+    if (browser && (!cookie || accessKey))
       setCookie(c, "openmuse_session", session.token, {
         prefix: "host",
         httpOnly: true,
@@ -184,6 +233,7 @@ export async function createApp(
   });
   app.route("/api/business", businessCallbackRoutes(business));
   app.use("/api/*", async (c, next) => {
+    const requestId = randomUUID();
     const signedRoute =
       /^\/api\/files\/[^/]+\/content$|^\/api\/browsers\/[^/]+\/(?:preview|console)$/.test(
         c.req.path,
@@ -192,16 +242,53 @@ export async function createApp(
     const cookie = sameOriginBrowser(c.req.raw.headers)
       ? getCookie(c, "openmuse_session", "host")
       : undefined;
-    const owner =
-      signedRoute && c.req.query("signature")
-        ? auth.verify(new URL(c.req.url))
-        : authorization
-          ? await auth.owner(authorization)
-          : cookie
-            ? await auth.ownerToken(cookie)
-            : await auth.owner();
+    let owner: string;
+    try {
+      owner =
+        signedRoute && c.req.query("signature")
+          ? auth.verify(new URL(c.req.url))
+          : authorization
+            ? await auth.owner(authorization)
+            : cookie
+              ? await auth.ownerToken(cookie)
+              : await auth.owner();
+    } catch (error) {
+      const denied = error instanceof AppError && [401, 403].includes(error.status);
+      await audit({
+        principalKind: "process",
+        principalId: "unauthenticated",
+        action: denied ? "auth.denied" : "auth.failure",
+        source: "openmuse.api",
+        outcome: denied ? "denied" : "failure",
+        requestId,
+      });
+      throw error;
+    }
+    const action = accessAction(c.req.path, c.req.method);
+    await audit({
+      principalKind: "owner",
+      principalId: owner,
+      action: `${action}.attempt`,
+      source: "openmuse.api",
+      outcome: "unknown",
+      requestId,
+    });
     c.set("owner", owner);
-    await next();
+    let failure: unknown;
+    try {
+      await next();
+    } catch (error) {
+      failure = error;
+    }
+    await audit({
+      principalKind: "owner",
+      principalId: owner,
+      action,
+      source: "openmuse.api",
+      outcome: failure || c.res.status >= 400 ? "failure" : "success",
+      requestId,
+    });
+    if (failure) throw failure;
   });
   const acceptance = (owner: string) =>
     db.get<LegalAcceptance>(owner, "legal-acceptances", legalAcceptanceId);
