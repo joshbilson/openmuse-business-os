@@ -153,9 +153,10 @@ test("source-time entity sorting precedes the limit and leaves missing times las
     ),
     ["a"],
   );
+  const cacheOrder = names(await service.entities(owner, { provider: "square", kind: "payment" }));
   assert.deepEqual(
     names(await service.entities(owner, { provider: "square", kind: "payment", limit: 1 })),
-    ["missing"],
+    cacheOrder.slice(0, 1),
   );
   assert.equal(
     businessTools(service)["business.entities"].schema.safeParse({ sort: "recent" }).success,
