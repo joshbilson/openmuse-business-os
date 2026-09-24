@@ -6,8 +6,10 @@ import { serveStatic } from "@hono/node-server/serve-static";
 import { createApp } from "./app.ts";
 import { readConfig } from "./config.ts";
 import { createStore } from "./db.ts";
+import { privateHttpsOptions } from "./private-https.ts";
 
 const config = readConfig();
+const privateHttps = privateHttpsOptions(process.env, config.publicUrl, config.port);
 const db = await createStore({
   dataDir: `${config.dataDir}/postgres`,
   databaseUrl: config.databaseUrl,
@@ -36,16 +38,25 @@ if (existsSync(`${webRoot}/index.html`)) {
 const server = serve({ fetch: app.fetch, port: config.port, hostname: config.host }, () =>
   console.log(`OpenMuse ${config.mode} API ready at ${config.publicUrl}`),
 );
+// A second loopback listener supports raw Tailscale TCP forwarding. The
+// existing HTTP loopback API remains available to local Hermes/MCP tools.
+const httpsServer = privateHttps
+  ? serve({ fetch: app.fetch, ...privateHttps }, () =>
+      console.log(`OpenMuse private HTTPS listener ready on 127.0.0.1:${privateHttps.port}`),
+    )
+  : undefined;
 let stopping = false;
 const shutdown = async () => {
   if (stopping) return;
   stopping = true;
   await Promise.all([engagement.stop(), business.stop()]);
   await agent.stop();
-  server.close(async () => {
-    await db.close();
-    process.exit(0);
-  });
+  await Promise.all([
+    new Promise<void>((resolve) => server.close(() => resolve())),
+    ...(httpsServer ? [new Promise<void>((resolve) => httpsServer.close(() => resolve()))] : []),
+  ]);
+  await db.close();
+  process.exit(0);
 };
 process.on("SIGINT", () => {
   void shutdown();
