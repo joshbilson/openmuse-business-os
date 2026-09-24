@@ -1,8 +1,14 @@
 import { z } from "zod";
+import {
+  assertModelVisibleProvider,
+  modelVisibleList,
+  modelVisibleObservation,
+  modelVisibleProviders,
+  modelVisibleSync,
+} from "./model-egress.ts";
 import type { BusinessService } from "./service.ts";
-import { businessProviders } from "./types.ts";
 
-const provider = z.enum(businessProviders);
+const provider = z.enum(modelVisibleProviders);
 const kind = z.enum([
   "merchant",
   "location",
@@ -22,12 +28,12 @@ export function businessTools(service: BusinessService) {
     "business.capabilities": {
       description: "List configured business sources and their verified capabilities.",
       schema: z.object({}),
-      run: (owner: string) => service.capabilities(owner),
+      run: async (owner: string) => modelVisibleList(await service.capabilities(owner)),
     },
     "business.observation": {
-      description: "Read durable business facts with source timestamps, status and sync cursors.",
+      description: "Read model-visible business facts with source timestamps and status.",
       schema: z.object({}),
-      run: (owner: string) => service.observation(owner),
+      run: async (owner: string) => modelVisibleObservation(await service.observation(owner)),
     },
     "business.sync": {
       description:
@@ -36,7 +42,12 @@ export function businessTools(service: BusinessService) {
       run: (
         owner: string,
         input: { provider: z.infer<typeof provider>; kind: z.infer<typeof kind>; cursor?: string },
-      ) => service.sync(owner, input.provider, input.kind, input.cursor),
+      ) => {
+        assertModelVisibleProvider(input.provider);
+        return service
+          .sync(owner, input.provider, input.kind, input.cursor)
+          .then((page) => modelVisibleSync(page, input.provider));
+      },
     },
     "business.entities": {
       description:
@@ -55,7 +66,10 @@ export function businessTools(service: BusinessService) {
           limit?: number;
           sort?: "newest" | "oldest";
         },
-      ) => service.entities(owner, input),
+      ) => {
+        if (input.provider !== undefined) assertModelVisibleProvider(input.provider);
+        return service.entities(owner, input).then(modelVisibleList);
+      },
     },
   };
 }

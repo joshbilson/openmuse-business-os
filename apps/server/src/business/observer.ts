@@ -74,6 +74,9 @@ export class BusinessObserver {
     const connections = await this.db.scan<BusinessConnection>("business-connections");
     for (const { owner, value } of connections) {
       if (value.status !== "verified") continue;
+      // Xero facts must not create Hermes tasks until separate model consent is enforced.
+      // Owner-initiated Xero API reads remain available outside this observer.
+      if (value.provider === "xero") continue;
       const status = await this.service.status(owner, value.provider);
       if (status.status !== "verified" || status.connectionId !== value.connectionId) continue;
       for (const kind of capabilities[value.provider]) {

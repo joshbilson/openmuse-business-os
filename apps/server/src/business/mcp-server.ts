@@ -2,6 +2,15 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { publishBusinessViewSchema } from "../../../../packages/domain/src/business-view.ts";
+import {
+  assertModelVisibleProvider,
+  assertModelVisibleViewIds,
+  modelVisibleList,
+  modelVisibleObservation,
+  modelVisibleProviders,
+  modelVisibleSync,
+  modelVisibleView,
+} from "./model-egress.ts";
 
 /** A small stdio MCP adapter for Hermes running on Oracle. It only calls the
  * owner-authenticated OpenMuse API; provider secrets remain inside the API. */
@@ -19,7 +28,7 @@ const tools = [
   },
   {
     name: "business_observation",
-    description: "Read business facts with source evidence, sync status, and freshness.",
+    description: "Read model-visible business facts with source evidence and freshness.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
@@ -34,7 +43,7 @@ const tools = [
     inputSchema: {
       type: "object",
       properties: {
-        provider: { type: "string", enum: ["square", "xero", "revolut", "google"] },
+        provider: { type: "string", enum: [...modelVisibleProviders] },
         kind: {
           type: "string",
           enum: [
@@ -62,7 +71,7 @@ const tools = [
     inputSchema: {
       type: "object",
       properties: {
-        provider: { type: "string", enum: ["square", "xero", "revolut", "google"] },
+        provider: { type: "string", enum: [...modelVisibleProviders] },
         kind: {
           type: "string",
           enum: [
@@ -92,7 +101,7 @@ export interface BusinessMcpOptions {
   fetcher?: typeof fetch;
 }
 
-const provider = z.enum(["square", "xero", "revolut", "google"]);
+const provider = z.enum(modelVisibleProviders);
 const kind = z.enum([
   "merchant",
   "location",
@@ -192,19 +201,27 @@ export function createBusinessMcpBridge(options: BusinessMcpOptions) {
     if (!schema) throw new Error("Unknown business tool");
     const input = schema.parse(rawInput) as Record<string, unknown>;
     let data: unknown;
-    if (name === "business_capabilities") data = await request("/api/business/capabilities");
-    else if (name === "business_publish_view") data = await request("/api/business/views", input);
-    else if (name === "business_observation") data = await request("/api/business/observation");
-    else if (name === "business_connections") data = await request("/api/business/connections");
+    if (name === "business_capabilities")
+      data = modelVisibleList(await request("/api/business/capabilities"));
+    else if (name === "business_publish_view") {
+      const factIds = input.factIds as string[];
+      assertModelVisibleViewIds(factIds);
+      data = modelVisibleView(await request("/api/business/views", input));
+    } else if (name === "business_observation")
+      data = modelVisibleObservation(await request("/api/business/observation"));
+    else if (name === "business_connections")
+      data = modelVisibleList(await request("/api/business/connections"));
     else if (name === "business_entities") {
+      if (input.provider !== undefined) assertModelVisibleProvider(String(input.provider));
       const url = new URL("/api/business/entities", base);
       for (const key of ["provider", "kind", "limit", "sort"] as const) {
         const value = input[key];
         if (value !== undefined) url.searchParams.set(key, String(value));
       }
-      data = await request(`${url.pathname}${url.search}`);
+      data = modelVisibleList(await request(`${url.pathname}${url.search}`));
     } else {
-      data = await request("/api/business/sync", input);
+      assertModelVisibleProvider(String(input.provider));
+      data = modelVisibleSync(await request("/api/business/sync", input), String(input.provider));
     }
     return { content: [{ type: "text", text: JSON.stringify(data) }] };
   };
