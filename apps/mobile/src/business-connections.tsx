@@ -181,6 +181,22 @@ export function BusinessConnections({ query = "" }: { query?: string }) {
                   Use {tenant.name}
                 </Button>
               ))}
+            <View style={{ flexDirection: "row", gap: 20 }}>
+              <Text
+                accessibilityRole="link"
+                onPress={() => void Linking.openURL(`${API_URL}/privacy`)}
+                style={{ color: colors.blueDark }}
+              >
+                Privacy notice
+              </Text>
+              <Text
+                accessibilityRole="link"
+                onPress={() => void Linking.openURL(`${API_URL}/terms`)}
+                style={{ color: colors.blueDark }}
+              >
+                Terms of use
+              </Text>
+            </View>
             {chosen?.configured ? (
               <Button primary busy={busy} onPress={() => void connect(selected)}>
                 Connect account

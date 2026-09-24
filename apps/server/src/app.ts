@@ -26,6 +26,13 @@ import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
 import { GoogleAuth } from "./google-auth.ts";
 import { HermesClient } from "./hermes.ts";
+import {
+  type LegalAcceptance,
+  legalAcceptanceId,
+  legalVersions,
+  privacyHtml,
+  termsHtml,
+} from "./legal.ts";
 import { operatorRoutes } from "./operator/routes.ts";
 import { WorkspaceService } from "./workspace.ts";
 
@@ -129,6 +136,9 @@ export async function createApp(
       browserConfigured: Boolean(config.workerUrl && config.workerToken),
     }),
   );
+  // Public documents contain no workspace data and must be readable before sign-in.
+  app.get("/privacy", (c) => c.html(privacyHtml));
+  app.get("/terms", (c) => c.html(termsHtml));
   let loginWindow = 0,
     loginAttempts = 0;
   app.post("/api/session", async (c) => {
@@ -191,6 +201,53 @@ export async function createApp(
             ? await auth.ownerToken(cookie)
             : await auth.owner();
     c.set("owner", owner);
+    await next();
+  });
+  const acceptance = (owner: string) =>
+    db.get<LegalAcceptance>(owner, "legal-acceptances", legalAcceptanceId);
+  app.get("/api/legal/status", async (c) => {
+    const record = config.mode === "live" ? await acceptance(c.get("owner")) : null;
+    return c.json({
+      required: config.mode === "live",
+      accepted: config.mode !== "live" || Boolean(record),
+      acceptedAt: record?.acceptedAt ?? null,
+      ...legalVersions,
+    });
+  });
+  app.post("/api/legal/accept", async (c) => {
+    const input = z
+      .strictObject({
+        agree: z.literal(true),
+        termsVersion: z.string().length(64),
+        privacyVersion: z.string().length(64),
+      })
+      .parse(await c.req.json());
+    if (
+      input.termsVersion !== legalVersions.terms ||
+      input.privacyVersion !== legalVersions.privacy
+    )
+      throw new AppError("Terms or privacy notice changed. Read the current documents.", 409);
+    const owner = c.get("owner");
+    const record: LegalAcceptance = {
+      id: legalAcceptanceId,
+      owner,
+      acceptedAt: new Date().toISOString(),
+      termsVersion: legalVersions.terms,
+      privacyVersion: legalVersions.privacy,
+      method: "authenticated_acceptance_request",
+    };
+    // Application-level insert-once record; PostgreSQL administrators can still alter records.
+    const saved =
+      (await db.insertIfAbsent(owner, "legal-acceptances", record)) ?? (await acceptance(owner));
+    return c.json({ accepted: true, acceptedAt: saved?.acceptedAt, ...legalVersions });
+  });
+  app.use("/api/*", async (c, next) => {
+    if (
+      config.mode === "live" &&
+      !["/api/legal/status", "/api/legal/accept", "/api/logout"].includes(c.req.path) &&
+      !(await acceptance(c.get("owner")))
+    )
+      throw new AppError("Accept the current terms and privacy notice before using OpenMuse.", 403);
     await next();
   });
   app.post("/api/logout", async (c) => {

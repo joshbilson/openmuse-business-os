@@ -7,6 +7,7 @@ import { after, before, test } from "node:test";
 import { createApp } from "../apps/server/src/app.ts";
 import type { Config } from "../apps/server/src/config.ts";
 import { createStore, type Store } from "../apps/server/src/db.ts";
+import { legalVersions } from "../apps/server/src/legal.ts";
 
 const origin = "https://openmuse.example.test";
 const ownerKey = "owner-key-for-cookie-tests-keep-private";
@@ -68,6 +69,16 @@ test("same-origin web login sets a host-only protected cookie and reload reuses 
   assert.equal(reload.status, 200);
   assert.equal((await reload.json()).token, token);
   assert.equal(reload.headers.get("set-cookie"), null);
+  const acceptance = await app.request("/api/legal/accept", {
+    method: "POST",
+    headers: { ...webHeaders, Cookie: cookie, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      agree: true,
+      termsVersion: legalVersions.terms,
+      privacyVersion: legalVersions.privacy,
+    }),
+  });
+  assert.equal(acceptance.status, 200);
   assert.equal(
     (await app.request("/api/workspace", { headers: { ...webHeaders, Cookie: cookie } })).status,
     200,

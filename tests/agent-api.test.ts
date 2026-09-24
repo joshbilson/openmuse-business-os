@@ -7,6 +7,7 @@ import { CopilotKitIntelligence } from "@copilotkit/runtime/v2";
 import { createApp } from "../apps/server/src/app.ts";
 import type { Config } from "../apps/server/src/config.ts";
 import { createStore, type Store } from "../apps/server/src/db.ts";
+import { legalVersions } from "../apps/server/src/legal.ts";
 import type {
   AgentMemory,
   AgentNotification,
@@ -325,15 +326,35 @@ test("live mode rejects sample sources and hides the fixture mutation endpoint",
     accessKey: "a-private-test-key-with-enough-characters",
   });
   try {
+    const login = await live.app.request("/api/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ accessKey: "a-private-test-key-with-enough-characters" }),
+    });
+    const liveToken = (await login.json()).token as string;
+    const liveHeaders = {
+      Authorization: `Bearer ${liveToken}`,
+      "Content-Type": "application/json",
+    };
+    const acceptance = await live.app.request("/api/legal/accept", {
+      method: "POST",
+      headers: liveHeaders,
+      body: JSON.stringify({
+        agree: true,
+        termsVersion: legalVersions.terms,
+        privacyVersion: legalVersions.privacy,
+      }),
+    });
+    assert.equal(acceptance.status, 200);
     const response = await live.app.request("/api/agent/sample-page", {
       method: "POST",
-      headers: headers(),
+      headers: liveHeaders,
       body: JSON.stringify({ text: "Changed" }),
     });
     assert.equal(response.status, 404);
     const monitor = await live.app.request("/api/agent/monitors", {
       method: "POST",
-      headers: headers(),
+      headers: liveHeaders,
       body: JSON.stringify({ title: "Forbidden fixture", url: "sample://availability" }),
     });
     assert.equal(monitor.status, 422);
